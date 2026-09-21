@@ -140,5 +140,40 @@ self.onmessage = async (e: MessageEvent) => {
       });
       break;
     }
+
+    case 'ABORT_FILE': {
+      const { fileId } = payload || {};
+      const filesToAbort = fileId ? [fileId] : Array.from(activeFiles.keys());
+
+      for (const id of filesToAbort) {
+        const target = activeFiles.get(id);
+        if (target) {
+          try {
+            target.accessHandle.close();
+          } catch (err) {
+            console.warn('Error closing access handle during abort:', err);
+          }
+
+          try {
+            const root = await navigator.storage.getDirectory();
+            const parts = (target.relativePath || target.fileName).split('/').filter(Boolean);
+            const fileName = parts.pop();
+            let currentDir = root;
+            for (const part of parts) {
+              currentDir = await currentDir.getDirectoryHandle(part, { create: false });
+            }
+            if (fileName) {
+              await currentDir.removeEntry(fileName, { recursive: true }).catch(() => {});
+            }
+          } catch (err) {
+            console.warn('Error deleting aborted OPFS file entry:', err);
+          }
+
+          activeFiles.delete(id);
+          self.postMessage({ type: 'FILE_ABORTED', fileId: id });
+        }
+      }
+      break;
+    }
   }
 };

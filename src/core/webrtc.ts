@@ -1,3 +1,4 @@
+import { getDefaultIceServers } from '../transport/ice';
 ﻿import { io, Socket } from 'socket.io-client';
 import { packChunk, unpackChunk, CHUNK_SIZE } from './protocol';
 import { deriveKeyFromPassword, encryptChunk, decryptChunk } from './crypto';
@@ -17,6 +18,7 @@ export interface TransferMetrics {
 }
 
 export interface PeerEvents {
+  onTransferAborted?: (reason?: string) => void;
   onPeerConnected: (peerId: string) => void;
   onPeerDisconnected: (peerId: string) => void;
   onMetrics: (metrics: TransferMetrics) => void;
@@ -32,6 +34,8 @@ export class DropLinkEngine {
   private worker: Worker;
   private events: PeerEvents;
   private cryptoKey: CryptoKey | null = null;
+  private isCancelled: boolean = false;
+  private isTransferring: boolean = false;
 
   // Synchronization maps
   private startAckResolvers: Map<number, () => void> = new Map();
@@ -54,6 +58,16 @@ export class DropLinkEngine {
 
     this.setupWorker();
     this.setupSocket();
+  }
+
+  public cancelTransfer(reason: string = 'Transfer cancelled') {
+    this.isCancelled = true;
+    this.sendControlMessage({ type: 'TRANSFER_ABORT', reason });
+    this.worker.postMessage({ type: 'ABORT_FILE' });
+    this.startAckResolvers.clear();
+    this.fileSavedResolvers.clear();
+    this.events.onTransferAborted?.(reason);
+    this.events.onStatusChange(reason);
   }
 
   public setPassword(password: string) {
@@ -116,6 +130,8 @@ export class DropLinkEngine {
           bytesTransferred: bytesWritten,
           totalBytes: fileSize,
         });
+      } else if (type === 'FILE_ABORTED') {
+        this.events.onStatusChange('OPFS partial storage purged');
       } else if (type === 'FILE_COMPLETE') {
         this.events.onFileReceived(fileName, relativePath, file, checksum);
         this.events.onStatusChange(`Saved to disk: ${fileName}`);
@@ -136,14 +152,7 @@ export class DropLinkEngine {
   }
 
   private async initPeerConnection(remotePeerId: string, isInitiator: boolean) {
-    const iceServers: RTCIceServer[] = [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-      { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-    ];
-
-    this.pc = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 10 });
+    this.pc = new RTCPeerConnection({ iceServers: getDefaultIceServers(), iceCandidatePoolSize: 10 });
 
     this.pc.onicecandidate = (e) => {
       if (e.candidate) {
@@ -181,9 +190,12 @@ export class DropLinkEngine {
     }
 
     this.pc.onconnectionstatechange = () => {
-      if (this.pc?.connectionState === 'connected') {
+      const state = this.pc?.connectionState;
+      if (state === 'connected') {
         this.events.onPeerConnected(remotePeerId);
         this.events.onStatusChange('P2P Direct Mesh Active');
+      } else if (this.isTransferring && (state === 'disconnected' || state === 'failed' || state === 'closed')) {
+        this.cancelTransfer('Peer connection lost');
       }
     };
   }
@@ -196,7 +208,16 @@ export class DropLinkEngine {
     dc.onmessage = (e) => {
       const msg = JSON.parse(e.data);
 
-      if (msg.type === 'START_FILE') {
+      if (msg.type === 'TRANSFER_ABORT') {
+        this.isCancelled = true;
+        this.worker.postMessage({ type: 'ABORT_FILE' });
+        this.startAckResolvers.clear();
+        this.fileSavedResolvers.clear();
+        const reason = msg.reason || 'Transfer cancelled by peer';
+        this.events.onTransferAborted?.(reason);
+        this.events.onStatusChange(reason);
+        return;
+      } else if (msg.type === 'START_FILE') {
         this.events.onStatusChange(`Preparing disk for: ${msg.fileName}`);
         this.worker.postMessage({
           type: 'INIT_FILE',
@@ -271,6 +292,7 @@ export class DropLinkEngine {
     if (!this.controlChannel || this.dataChannels.length === 0) return;
 
     for (let i = 0; i < items.length; i++) {
+      if (this.isCancelled) break;
       const { file, relativePath } = items[i];
       const fileId = i + 1;
 
@@ -308,6 +330,7 @@ export class DropLinkEngine {
       const startTime = performance.now();
 
       while (offset < total) {
+        if (this.isCancelled) break;
         const channel = this.dataChannels[channelIdx];
         channelIdx = (channelIdx + 1) % this.dataChannels.length;
 

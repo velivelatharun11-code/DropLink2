@@ -122,5 +122,31 @@ self.onmessage = async (event: MessageEvent) => {
       }
       break;
     }
+
+    case 'ABORT_FILE': {
+      if (currentSession) {
+        const fileId = currentSession.fileId;
+        const fileName = currentSession.fileName;
+        try {
+          if (currentSession.writable) {
+            await currentSession.writable.abort().catch(() => {});
+          }
+          const root = await navigator.storage.getDirectory();
+          await root.removeEntry(fileName).catch(() => {});
+        } catch (err: any) {
+          console.warn('Worker OPFS abort cleanup error:', err);
+        } finally {
+          currentSession = null;
+          const abortMsg: WorkerOutgoingMessage = {
+            type: 'FILE_COMPLETE',
+            fileId,
+            status: 'ABORTED',
+            error: data?.reason || 'Transfer aborted'
+          };
+          self.postMessage(abortMsg);
+        }
+      }
+      break;
+    }
   }
 };

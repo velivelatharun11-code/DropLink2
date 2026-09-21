@@ -2,9 +2,18 @@ import { useState, useEffect, useRef, type ChangeEvent } from 'react';
 import QRCode from 'qrcode';
 import { DropLinkEngine, type ExtendedFile, type TransferMetrics } from './core/webrtc';
 import { downloadAllAsZip } from './core/zip';
+import {
+  listOPFSFiles,
+  getStorageQuota,
+  getOPFSFileBlob,
+  purgeOPFSEntry,
+  purgeAllOPFS,
+  type StoredOPFSFile,
+  type StorageQuotaInfo
+} from './storage/cleaner';
 import { 
   HardDrive, Send, Download, Wifi, CheckCircle2, ShieldCheck, 
-  Copy, Check, FolderUp, Files, Activity, Gauge, Database, Archive, Lock 
+  Copy, Check, FolderUp, Files, Activity, Gauge, Database, Archive, Lock, Trash2, RefreshCw, XCircle, Folder 
 } from 'lucide-react';
 
 export default function App() {
@@ -24,6 +33,10 @@ export default function App() {
   }[]>([]);
   const [selectedItems, setSelectedItems] = useState<ExtendedFile[]>([]);
   const [copied, setCopied] = useState(false);
+  const [showStorageModal, setShowStorageModal] = useState(false);
+  const [opfsFiles, setOpfsFiles] = useState<StoredOPFSFile[]>([]);
+  const [quotaInfo, setQuotaInfo] = useState<StorageQuotaInfo | null>(null);
+  const [isTransferring, setIsTransferring] = useState(false);
 
   const engineRef = useRef<DropLinkEngine | null>(null);
 
@@ -46,7 +59,15 @@ export default function App() {
       signalingUrl,
       {
         onPeerConnected: (id) => setConnectedPeer(id),
-        onPeerDisconnected: () => setConnectedPeer(null),
+        onPeerDisconnected: () => {
+          setConnectedPeer(null);
+          setIsTransferring(false);
+        },
+        onTransferAborted: (reason) => {
+          setIsTransferring(false);
+          setMetrics(null);
+          setStatus(reason || 'Transfer Aborted');
+        },
         onMetrics: (m) => setMetrics(m),
         onFileReceived: (name, path, file, checksum) => {
           const url = URL.createObjectURL(file);
@@ -59,6 +80,52 @@ export default function App() {
 
     engineRef.current.joinRoom(roomId);
     setJoined(true);
+  };
+
+  const refreshStorage = async () => {
+    try {
+      const [files, quota] = await Promise.all([listOPFSFiles(), getStorageQuota()]);
+      setOpfsFiles(files);
+      setQuotaInfo(quota);
+    } catch (err) {
+      console.warn('Storage refresh error:', err);
+    }
+  };
+
+  useEffect(() => {
+    refreshStorage();
+  }, [receivedFiles]);
+
+  const handleDownloadOPFSFile = async (filePath: string, fileName: string) => {
+    const blob = await getOPFSFileBlob(filePath);
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDeleteOPFSFile = async (filePath: string) => {
+    await purgeOPFSEntry(filePath);
+    await refreshStorage();
+  };
+
+  const handlePurgeAllOPFS = async () => {
+    if (window.confirm('Are you sure you want to permanently delete all files in OPFS storage?')) {
+      await purgeAllOPFS();
+      setReceivedFiles([]);
+      await refreshStorage();
+    }
+  };
+
+  const handleCancelTransfer = () => {
+    if (engineRef.current) {
+      engineRef.current.cancelTransfer('Transfer aborted by user');
+      setIsTransferring(false);
+      setMetrics(null);
+    }
   };
 
   const handleCopy = () => {
@@ -87,7 +154,8 @@ export default function App() {
 
   const handleSend = () => {
     if (selectedItems.length > 0 && engineRef.current) {
-      engineRef.current.sendBatch(selectedItems);
+      setIsTransferring(true);
+      engineRef.current.sendBatch(selectedItems).finally(() => setIsTransferring(false));
     }
   };
 
@@ -228,7 +296,7 @@ export default function App() {
 
               <button
                 onClick={handleSend}
-                disabled={selectedItems.length === 0 || !connectedPeer}
+                disabled={selectedItems.length === 0 || !connectedPeer || isTransferring}
                 className="w-full flex items-center justify-center gap-2 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600 font-medium rounded-lg transition-colors cursor-pointer"
               >
                 <Send className="w-4 h-4" /> Stream Batch Directly to Disk
@@ -267,6 +335,15 @@ export default function App() {
                     <span>{(metrics.bytesTransferred / (1024 * 1024)).toFixed(0)} MB done</span>
                   </div>
                 </div>
+                  <div className="pt-2 flex items-center justify-end">
+                    <button
+                      onClick={handleCancelTransfer}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-950/70 hover:bg-rose-900 border border-rose-800/80 text-rose-300 text-xs font-semibold rounded-lg transition-colors cursor-pointer"
+                    >
+                      <XCircle className="w-4 h-4 text-rose-400" />
+                      <span>Cancel Transfer</span>
+                    </button>
+                  </div>
               </div>
             )}
 
@@ -318,6 +395,103 @@ export default function App() {
           </div>
         )}
 
+        {/* OPFS Storage Modal */}
+        {showStorageModal && (
+          <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-neutral-900 border border-neutral-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 max-h-[85vh] flex flex-col">
+              <div className="flex items-center justify-between pb-3 border-b border-neutral-800">
+                <div className="flex items-center gap-2">
+                  <Database className="w-5 h-5 text-indigo-400" />
+                  <h2 className="text-base font-bold text-neutral-100">OPFS Storage Manager</h2>
+                </div>
+                <button
+                  onClick={() => setShowStorageModal(false)}
+                  className="p-1 hover:bg-neutral-800 rounded-lg text-neutral-400 hover:text-neutral-200 transition-colors cursor-pointer"
+                >
+                  <XCircle className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Quota Bar */}
+              {quotaInfo && (
+                <div className="p-3 bg-neutral-950/70 border border-neutral-800 rounded-xl space-y-2 text-xs font-mono">
+                  <div className="flex justify-between text-neutral-300">
+                    <span>Used: {(quotaInfo.usageBytes / (1024 * 1024)).toFixed(1)} MB</span>
+                    <span>Quota: {(quotaInfo.quotaBytes / (1024 * 1024 * 1024)).toFixed(1)} GB</span>
+                  </div>
+                  <div className="w-full bg-neutral-800 rounded-full h-1.5 overflow-hidden">
+                    <div
+                      className="bg-indigo-500 h-full transition-all"
+                      style={{ width: `${Math.max(2, quotaInfo.percentUsed)}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Stored Files List */}
+              <div className="flex-1 overflow-y-auto space-y-2 pr-1 min-h-[160px]">
+                {opfsFiles.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center h-36 text-neutral-500 text-xs gap-2">
+                    <Folder className="w-8 h-8 opacity-40" />
+                    <span>No files currently saved in OPFS</span>
+                  </div>
+                ) : (
+                  opfsFiles.map((file, idx) => (
+                    <div
+                      key={idx}
+                      className="flex items-center justify-between p-2.5 bg-neutral-800/50 hover:bg-neutral-800/80 border border-neutral-800 rounded-lg text-xs"
+                    >
+                      <div className="truncate pr-2 max-w-[280px]">
+                        <p className="text-neutral-200 font-medium truncate" title={file.path}>
+                          {file.path}
+                        </p>
+                        <p className="text-[10px] text-neutral-400 font-mono">
+                          {(file.size / (1024 * 1024)).toFixed(2)} MB
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          onClick={() => handleDownloadOPFSFile(file.path, file.name)}
+                          className="p-1.5 bg-neutral-700/60 hover:bg-neutral-700 rounded text-indigo-400 hover:text-indigo-300 transition-colors cursor-pointer"
+                          title="Download file"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteOPFSFile(file.path)}
+                          className="p-1.5 bg-rose-950/40 hover:bg-rose-900/60 rounded text-rose-400 transition-colors cursor-pointer"
+                          title="Delete from OPFS"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {/* Actions Footer */}
+              <div className="flex items-center justify-between pt-3 border-t border-neutral-800">
+                <button
+                  onClick={refreshStorage}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs font-medium rounded-lg transition-colors cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Refresh</span>
+                </button>
+                {opfsFiles.length > 0 && (
+                  <button
+                    onClick={handlePurgeAllOPFS}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-950/80 hover:bg-rose-900 border border-rose-800/80 text-rose-300 text-xs font-medium rounded-lg transition-colors cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Purge All Storage</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
