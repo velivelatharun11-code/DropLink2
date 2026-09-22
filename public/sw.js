@@ -1,4 +1,4 @@
-const CACHE_NAME = 'droplink2-v1';
+﻿const CACHE_NAME = 'droplink2-v2';
 const STATIC_ASSETS = [
   '/',
   '/index.html',
@@ -27,17 +27,40 @@ self.addEventListener('activate', (e) => {
 });
 
 self.addEventListener('fetch', (e) => {
-  // Only cache GET requests; skip Socket.IO requests
-  if (e.request.method !== 'GET' || e.request.url.includes('/socket.io/')) {
+  const url = new URL(e.request.url);
+
+  // Bypass non-GET, WebRTC signaling, Socket.IO, and chrome extensions
+  if (
+    e.request.method !== 'GET' ||
+    url.pathname.startsWith('/socket.io') ||
+    !url.protocol.startsWith('http')
+  ) {
     return;
   }
 
   e.respondWith(
     caches.match(e.request).then((cached) => {
-      return (
-        cached ||
-        fetch(e.request).catch(() => caches.match('/index.html'))
-      );
+      if (cached) return cached;
+
+      return fetch(e.request)
+        .then((response) => {
+          // Cache successful responses for scripts, styles, and assets
+          if (
+            response &&
+            response.status === 200 &&
+            (url.pathname.startsWith('/assets/') || STATIC_ASSETS.includes(url.pathname))
+          ) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(e.request, clone));
+          }
+          return response;
+        })
+        .catch(() => {
+          // SPA fallback for navigation requests
+          if (e.request.mode === 'navigate') {
+            return caches.match('/index.html');
+          }
+        });
     })
   );
 });
