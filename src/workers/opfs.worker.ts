@@ -30,6 +30,7 @@ interface ActiveFile {
   bytesWritten: number;
 }
 
+const CHUNK_SIZE = 64 * 1024;
 const activeFiles = new Map<string, ActiveFile>();
 
 async function getNestedFileHandle(root: FileSystemDirectoryHandle, path: string): Promise<FileSystemFileHandle> {
@@ -64,8 +65,19 @@ self.onmessage = async (e: MessageEvent) => {
         
         const accessHandle = await (fileHandle as any).createSyncAccessHandle() as FileSystemSyncAccessHandle;
         
-        // Truncate to 0 bytes so no stale data from prior transfers remains
-        accessHandle.truncate(0);
+        // Chunk resumption detection: inspect existing partial file size
+        const existingSize = accessHandle.getSize();
+        let resumedOffset = 0;
+
+        if (existingSize > 0 && existingSize < fileSize) {
+          // Align down to the nearest safe chunk boundary
+          resumedOffset = Math.floor(existingSize / CHUNK_SIZE) * CHUNK_SIZE;
+          accessHandle.truncate(resumedOffset);
+        } else {
+          // Stale, complete, or new file: reset to 0
+          accessHandle.truncate(0);
+          resumedOffset = 0;
+        }
 
         activeFiles.set(fileId, {
           fileHandle,
@@ -73,11 +85,11 @@ self.onmessage = async (e: MessageEvent) => {
           fileName,
           relativePath: filePath,
           fileSize,
-          bytesWritten: 0,
+          bytesWritten: resumedOffset,
         });
 
-        // Notify main thread that handle is initialized and ready
-        self.postMessage({ type: 'FILE_INITIALIZED', fileId });
+        // Notify main thread with verified resume boundary
+        self.postMessage({ type: 'FILE_INITIALIZED', fileId, resumedOffset });
       } catch (err: any) {
         self.postMessage({ type: 'ERROR', fileId, error: err.message });
       }
@@ -90,7 +102,6 @@ self.onmessage = async (e: MessageEvent) => {
       if (!target) return;
 
       const uint8 = new Uint8Array(buffer);
-      // Write directly at the designated byte offset
       target.accessHandle.write(uint8, { at: offset });
       target.bytesWritten += uint8.byteLength;
 
@@ -110,7 +121,6 @@ self.onmessage = async (e: MessageEvent) => {
       const target = activeFiles.get(fileId);
       if (!target) return;
 
-      // Ensure exact file size on disk before flushing
       target.accessHandle.truncate(target.fileSize);
       target.accessHandle.flush();
       target.accessHandle.close();
@@ -142,37 +152,13 @@ self.onmessage = async (e: MessageEvent) => {
     }
 
     case 'ABORT_FILE': {
-      const { fileId } = payload || {};
-      const filesToAbort = fileId ? [fileId] : Array.from(activeFiles.keys());
-
-      for (const id of filesToAbort) {
-        const target = activeFiles.get(id);
-        if (target) {
-          try {
-            target.accessHandle.close();
-          } catch (err) {
-            console.warn('Error closing access handle during abort:', err);
-          }
-
-          try {
-            const root = await navigator.storage.getDirectory();
-            const parts = (target.relativePath || target.fileName).split('/').filter(Boolean);
-            const fileName = parts.pop();
-            let currentDir = root;
-            for (const part of parts) {
-              currentDir = await currentDir.getDirectoryHandle(part, { create: false });
-            }
-            if (fileName) {
-              await currentDir.removeEntry(fileName, { recursive: true }).catch(() => {});
-            }
-          } catch (err) {
-            console.warn('Error deleting aborted OPFS file entry:', err);
-          }
-
-          activeFiles.delete(id);
-          self.postMessage({ type: 'FILE_ABORTED', fileId: id });
-        }
+      for (const [, target] of activeFiles.entries()) {
+        try {
+          target.accessHandle.close();
+        } catch {}
       }
+      activeFiles.clear();
+      self.postMessage({ type: 'FILE_ABORTED' });
       break;
     }
   }

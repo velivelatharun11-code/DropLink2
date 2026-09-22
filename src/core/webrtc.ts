@@ -38,7 +38,7 @@ export class DropLinkEngine {
   private isTransferring: boolean = false;
 
   // Synchronization maps
-  private startAckResolvers: Map<number, () => void> = new Map();
+  private startAckResolvers: Map<number, (resumedOffset: number) => void> = new Map();
   private fileSavedResolvers: Map<number, () => void> = new Map();
 
   constructor(serverUrl: string, events: PeerEvents, password?: string) {
@@ -119,7 +119,8 @@ export class DropLinkEngine {
       const { type, fileId, fileName, relativePath, file, bytesWritten, fileSize, checksum } = e.data;
 
       if (type === 'FILE_INITIALIZED') {
-        this.sendControlMessage({ type: 'START_ACK', fileId: Number(fileId) });
+        const { resumedOffset } = e.data;
+        this.sendControlMessage({ type: 'START_ACK', fileId: Number(fileId), resumedOffset: resumedOffset || 0 });
       } else if (type === 'WRITE_PROGRESS') {
         const pct = fileSize > 0 ? (bytesWritten / fileSize) * 100 : 100;
         this.events.onMetrics({
@@ -231,7 +232,7 @@ export class DropLinkEngine {
       } else if (msg.type === 'START_ACK') {
         const resolve = this.startAckResolvers.get(Number(msg.fileId));
         if (resolve) {
-          resolve();
+          resolve(Number(msg.resumedOffset || 0));
           this.startAckResolvers.delete(Number(msg.fileId));
         }
       } else if (msg.type === 'END_FILE') {
@@ -296,7 +297,7 @@ export class DropLinkEngine {
       const { file, relativePath } = items[i];
       const fileId = i + 1;
 
-      const startAckPromise = new Promise<void>((resolve) => {
+      const startAckPromise = new Promise<number>((resolve) => {
         this.startAckResolvers.set(fileId, resolve);
       });
       const fileSavedPromise = new Promise<void>((resolve) => {
