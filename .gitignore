@@ -3,5 +3,12 @@ dist
 dist-ssr
 *.local
 .env.local
+.env.production.local
 .DS_Store
 Thumbs.db
+
+# DropLink2 Large Synthetic Stress Test Binaries
+test_*.bin
+*.bin
+DropLink_FolderTest/
+tests/temp_*

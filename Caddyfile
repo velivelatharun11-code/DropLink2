@@ -1,0 +1,3 @@
+﻿droplink.yourdomain.com {
+    reverse_proxy droplink2:3001
+}

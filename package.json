@@ -9,7 +9,8 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "server": "node server.js",
-    "start": "node start.js"
+    "start": "node start.js",
+    "test": "node tests/stress-test.cjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

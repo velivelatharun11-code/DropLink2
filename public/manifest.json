@@ -1,15 +1,14 @@
 ﻿{
-  "name": "DropLink2 - P2P File Streamer",
+  "name": "DropLink2 P2P Streamer",
   "short_name": "DropLink2",
-  "description": "Zero-RAM, direct-to-disk browser P2P file transfer",
+  "description": "Zero-RAM OPFS P2P Streamer with E2EE AES-GCM",
   "start_url": "/",
-  "scope": "/",
   "display": "standalone",
-  "background_color": "#0a0a0a",
+  "background_color": "#09090b",
   "theme_color": "#4f46e5",
   "icons": [
     {
-      "src": "/favicon.svg",
+      "src": "/vite.svg",
       "sizes": "192x192 512x512",
       "type": "image/svg+xml",
       "purpose": "any maskable"

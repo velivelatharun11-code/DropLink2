@@ -1,7 +1,8 @@
-import { getDefaultIceServers } from '../transport/ice';
-﻿import { io, Socket } from 'socket.io-client';
-import { packChunk, unpackChunk, CHUNK_SIZE } from './protocol';
-import { deriveKeyFromPassword, encryptChunk, decryptChunk } from './crypto';
+﻿import { getDefaultIceServers } from '../transport/ice';
+import { io, Socket } from 'socket.io-client';
+import { unpackChunk, DEFAULT_CHUNK_SIZE } from '../engine/framing';
+import { decryptChunk, deriveKey } from '../engine/crypto';
+import { StripeMultiplexer } from '../engine/stripeMultiplexer';
 
 export interface ExtendedFile {
   file: File;
@@ -15,10 +16,13 @@ export interface TransferMetrics {
   currentFileName: string;
   bytesTransferred: number;
   totalBytes: number;
+  isPaused?: boolean;
 }
 
 export interface PeerEvents {
   onTransferAborted?: (reason?: string) => void;
+  onTransferPaused?: () => void;
+  onTransferResumed?: () => void;
   onPeerConnected: (peerId: string) => void;
   onPeerDisconnected: (peerId: string) => void;
   onMetrics: (metrics: TransferMetrics) => void;
@@ -32,12 +36,13 @@ export class DropLinkEngine {
   private dataChannels: RTCDataChannel[] = [];
   private controlChannel: RTCDataChannel | null = null;
   private worker: Worker;
+  private activeSenderWorker: Worker | null = null;
   private events: PeerEvents;
   private cryptoKey: CryptoKey | null = null;
   private isCancelled: boolean = false;
   private isTransferring: boolean = false;
+  private isPaused: boolean = false;
 
-  // Synchronization maps
   private startAckResolvers: Map<number, (resumedOffset: number) => void> = new Map();
   private fileSavedResolvers: Map<number, () => void> = new Map();
 
@@ -46,7 +51,8 @@ export class DropLinkEngine {
     this.socket = io(serverUrl);
 
     if (password && password.trim().length > 0) {
-      deriveKeyFromPassword(password.trim()).then((key) => {
+      const salt = new TextEncoder().encode('droplink2-static-salt-v1');
+      deriveKey(password.trim(), salt).then((key: CryptoKey) => {
         this.cryptoKey = key;
       });
     }
@@ -60,8 +66,36 @@ export class DropLinkEngine {
     this.setupSocket();
   }
 
+  public pauseTransfer() {
+    if (!this.isTransferring || this.isPaused) return;
+    this.isPaused = true;
+    if (this.activeSenderWorker) {
+      this.activeSenderWorker.postMessage({ type: 'PAUSE' });
+    }
+    this.sendControlMessage({ type: 'TRANSFER_PAUSED' });
+    this.events.onTransferPaused?.();
+    this.events.onStatusChange('Transfer paused');
+  }
+
+  public resumeTransfer() {
+    if (!this.isTransferring || !this.isPaused) return;
+    this.isPaused = false;
+    if (this.activeSenderWorker) {
+      this.activeSenderWorker.postMessage({ type: 'RESUME' });
+    }
+    this.sendControlMessage({ type: 'TRANSFER_RESUMED' });
+    this.events.onTransferResumed?.();
+    this.events.onStatusChange('Transfer resumed');
+  }
+
   public cancelTransfer(reason: string = 'Transfer cancelled') {
     this.isCancelled = true;
+    this.isPaused = false;
+    if (this.activeSenderWorker) {
+      this.activeSenderWorker.postMessage({ type: 'CANCEL' });
+      this.activeSenderWorker.terminate();
+      this.activeSenderWorker = null;
+    }
     this.sendControlMessage({ type: 'TRANSFER_ABORT', reason });
     this.worker.postMessage({ type: 'ABORT_FILE' });
     this.startAckResolvers.clear();
@@ -72,7 +106,8 @@ export class DropLinkEngine {
 
   public setPassword(password: string) {
     if (password && password.trim().length > 0) {
-      deriveKeyFromPassword(password.trim()).then((key) => {
+      const salt = new TextEncoder().encode('droplink2-static-salt-v1');
+      deriveKey(password.trim(), salt).then((key: CryptoKey) => {
         this.cryptoKey = key;
       });
     } else {
@@ -124,16 +159,26 @@ export class DropLinkEngine {
       } else if (type === 'WRITE_PROGRESS') {
         const pct = fileSize > 0 ? (bytesWritten / fileSize) * 100 : 100;
         this.events.onMetrics({
-          percent: pct,
+          percent: Math.min(100, pct),
           speedMBps: 0,
           bufferedAmountMB: 0,
           currentFileName: fileName,
           bytesTransferred: bytesWritten,
           totalBytes: fileSize,
+          isPaused: this.isPaused,
         });
       } else if (type === 'FILE_ABORTED') {
         this.events.onStatusChange('OPFS partial storage purged');
       } else if (type === 'FILE_COMPLETE') {
+        this.events.onMetrics({
+          percent: 100,
+          speedMBps: 0,
+          bufferedAmountMB: 0,
+          currentFileName: fileName,
+          bytesTransferred: fileSize || 0,
+          totalBytes: fileSize || 0,
+          isPaused: false,
+        });
         this.events.onFileReceived(fileName, relativePath, file, checksum);
         this.events.onStatusChange(`Saved to disk: ${fileName}`);
         this.sendControlMessage({ type: 'FILE_SAVED', fileId: Number(fileId) });
@@ -153,7 +198,12 @@ export class DropLinkEngine {
   }
 
   private async initPeerConnection(remotePeerId: string, isInitiator: boolean) {
-    this.pc = new RTCPeerConnection({ iceServers: getDefaultIceServers(), iceCandidatePoolSize: 10 });
+    this.pc = new RTCPeerConnection({
+      iceServers: getDefaultIceServers(),
+      iceCandidatePoolSize: 10,
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require'
+    });
 
     this.pc.onicecandidate = (e) => {
       if (e.candidate) {
@@ -211,6 +261,7 @@ export class DropLinkEngine {
 
       if (msg.type === 'TRANSFER_ABORT') {
         this.isCancelled = true;
+        this.isPaused = false;
         this.worker.postMessage({ type: 'ABORT_FILE' });
         this.startAckResolvers.clear();
         this.fileSavedResolvers.clear();
@@ -218,6 +269,14 @@ export class DropLinkEngine {
         this.events.onTransferAborted?.(reason);
         this.events.onStatusChange(reason);
         return;
+      } else if (msg.type === 'TRANSFER_PAUSED') {
+        this.isPaused = true;
+        this.events.onTransferPaused?.();
+        this.events.onStatusChange('Transfer paused by peer');
+      } else if (msg.type === 'TRANSFER_RESUMED') {
+        this.isPaused = false;
+        this.events.onTransferResumed?.();
+        this.events.onStatusChange('Transfer resumed by peer');
       } else if (msg.type === 'START_FILE') {
         this.events.onStatusChange(`Preparing disk for: ${msg.fileName}`);
         this.worker.postMessage({
@@ -251,7 +310,7 @@ export class DropLinkEngine {
   }
 
   private async handleIncomingChunk(buffer: ArrayBuffer) {
-    const { fileId, byteOffset, payload } = unpackChunk(buffer);
+    const { fileId, byteOffset, payload } = unpackChunk(new Uint8Array(buffer));
     let finalPayload = payload;
 
     if (this.cryptoKey) {
@@ -268,35 +327,24 @@ export class DropLinkEngine {
         type: 'WRITE_CHUNK',
         payload: { fileId: String(fileId), offset: byteOffset, buffer: finalPayload },
       },
-      [finalPayload]
+      [finalPayload.buffer]
     );
-  }
-
-  private async drainAllChannels(): Promise<void> {
-    const promises = this.dataChannels.map((channel) => {
-      if (channel.bufferedAmount === 0) return Promise.resolve();
-      return new Promise<void>((resolve) => {
-        const check = () => {
-          if (channel.bufferedAmount === 0) {
-            channel.removeEventListener('bufferedamountlow', check);
-            resolve();
-          }
-        };
-        channel.bufferedAmountLowThreshold = 0;
-        channel.addEventListener('bufferedamountlow', check);
-      });
-    });
-    await Promise.all(promises);
   }
 
   public async sendBatch(items: ExtendedFile[]) {
     if (!this.controlChannel || this.dataChannels.length === 0) return;
+    this.isCancelled = false;
+    this.isPaused = false;
+    this.isTransferring = true;
+
+    const multiplexer = new StripeMultiplexer(this.dataChannels);
 
     for (let i = 0; i < items.length; i++) {
       if (this.isCancelled) break;
       const { file, relativePath } = items[i];
       const fileId = i + 1;
 
+      let safeResumeOffset = 0;
       const startAckPromise = new Promise<number>((resolve) => {
         this.startAckResolvers.set(fileId, resolve);
       });
@@ -304,7 +352,7 @@ export class DropLinkEngine {
         this.fileSavedResolvers.set(fileId, resolve);
       });
 
-      this.events.onStatusChange(`[File ${i + 1}/${items.length}] Initiating: ${file.name}`);
+      this.events.onStatusChange(`[File ${i + 1}/${items.length}] Handshake: ${file.name}`);
 
       this.controlChannel.send(
         JSON.stringify({
@@ -316,71 +364,96 @@ export class DropLinkEngine {
         })
       );
 
-      // Wait for receiver to confirm OPFS handle is prepared
-      await Promise.race([
+      safeResumeOffset = await Promise.race([
         startAckPromise,
-        new Promise((resolve) => setTimeout(resolve, 10000)),
+        new Promise<number>((resolve) => setTimeout(() => resolve(0), 10000)),
       ]);
 
-      this.events.onStatusChange(`[File ${i + 1}/${items.length}] Streaming: ${file.name}`);
-
-      let offset = 0;
-      let chunkIndex = 0;
-      let channelIdx = 0;
-      const total = file.size;
-      const startTime = performance.now();
-
-      while (offset < total) {
-        if (this.isCancelled) break;
-        const channel = this.dataChannels[channelIdx];
-        channelIdx = (channelIdx + 1) % this.dataChannels.length;
-
-        // Keep buffer threshold tighter to avoid SCTP frame congestion
-        if (channel.bufferedAmount > 1024 * 1024) {
-          await new Promise((resolve) => {
-            const onLow = () => {
-              channel.removeEventListener('bufferedamountlow', onLow);
-              resolve(null);
-            };
-            channel.bufferedAmountLowThreshold = 256 * 1024;
-            channel.addEventListener('bufferedamountlow', onLow);
-          });
-        }
-
-        const slice = file.slice(offset, offset + CHUNK_SIZE);
-        let rawBuffer = await slice.arrayBuffer();
-
-        if (this.cryptoKey) {
-          rawBuffer = await encryptChunk(rawBuffer, this.cryptoKey);
-        }
-
-        const packet = packChunk(fileId, chunkIndex, offset, rawBuffer);
-        channel.send(packet);
-
-        offset += slice.size;
-        chunkIndex++;
-
-        const elapsedSec = (performance.now() - startTime) / 1000;
-        const speed = elapsedSec > 0 ? offset / (1024 * 1024) / elapsedSec : 0;
-        const currentBufferMB = this.dataChannels.reduce((sum, ch) => sum + ch.bufferedAmount, 0) / (1024 * 1024);
-
-        this.events.onMetrics({
-          percent: (offset / total) * 100,
-          speedMBps: speed,
-          bufferedAmountMB: currentBufferMB,
-          currentFileName: file.name,
-          bytesTransferred: offset,
-          totalBytes: total,
-        });
+      if (safeResumeOffset > 0) {
+        this.events.onStatusChange(`[File ${i + 1}/${items.length}] Resuming ${file.name} from ${(safeResumeOffset / 1024 / 1024).toFixed(1)} MB`);
+      } else {
+        this.events.onStatusChange(`[File ${i + 1}/${items.length}] Streaming: ${file.name}`);
       }
 
-      // CRITICAL: Drain all pending in-flight bytes across all channels before sending END_FILE
-      await this.drainAllChannels();
+      const startTime = performance.now();
+      await new Promise<void>((resolve, reject) => {
+        this.activeSenderWorker = new Worker(
+          new URL('../workers/transferSender.worker.js', import.meta.url),
+          { type: 'module' }
+        );
+
+        this.activeSenderWorker.onmessage = async (e) => {
+          const { type, data } = e.data;
+
+          if (type === 'CHUNK_PACKET') {
+            const { packet, byteOffset, totalSize } = data;
+            try {
+              if (this.isCancelled) {
+                this.activeSenderWorker?.postMessage({ type: 'CANCEL' });
+                this.activeSenderWorker?.terminate();
+                this.activeSenderWorker = null;
+                resolve();
+                return;
+              }
+
+              await multiplexer.sendPacket(new Uint8Array(packet));
+
+              const elapsedSec = (performance.now() - startTime) / 1000;
+              const speed = elapsedSec > 0 && !this.isPaused ? byteOffset / (1024 * 1024) / elapsedSec : 0;
+              const currentBufferMB = this.dataChannels.reduce((sum, ch) => sum + ch.bufferedAmount, 0) / (1024 * 1024);
+
+              this.events.onMetrics({
+                percent: Math.min(100, (byteOffset / totalSize) * 100),
+                speedMBps: speed,
+                bufferedAmountMB: currentBufferMB,
+                currentFileName: file.name,
+                bytesTransferred: byteOffset,
+                totalBytes: totalSize,
+                isPaused: this.isPaused,
+              });
+            } catch (err) {
+              this.activeSenderWorker?.terminate();
+              this.activeSenderWorker = null;
+              reject(err);
+            }
+          } else if (type === 'TRANSFER_COMPLETE') {
+            this.activeSenderWorker?.terminate();
+            this.activeSenderWorker = null;
+            resolve();
+          } else if (type === 'ERROR') {
+            this.activeSenderWorker?.terminate();
+            this.activeSenderWorker = null;
+            reject(new Error(data.message));
+          }
+        };
+
+        this.activeSenderWorker.postMessage({
+          type: 'START_TRANSFER',
+          data: {
+            file,
+            fileId,
+            key: this.cryptoKey,
+            startOffset: safeResumeOffset,
+            chunkSize: DEFAULT_CHUNK_SIZE,
+          },
+        });
+      });
+
+      await multiplexer.flush();
+
+      this.events.onMetrics({
+        percent: 100,
+        speedMBps: 0,
+        bufferedAmountMB: 0,
+        currentFileName: file.name,
+        bytesTransferred: file.size,
+        totalBytes: file.size,
+        isPaused: false,
+      });
 
       this.controlChannel.send(JSON.stringify({ type: 'END_FILE', fileId }));
       this.events.onStatusChange(`[File ${i + 1}/${items.length}] Waiting for receiver disk flush: ${file.name}...`);
 
-      // Wait for receiver worker to flush OPFS and send back FILE_SAVED
       await Promise.race([
         fileSavedPromise,
         new Promise((resolve) => setTimeout(resolve, 60000)),
@@ -389,6 +462,8 @@ export class DropLinkEngine {
       this.events.onStatusChange(`[File ${i + 1}/${items.length}] Confirmed & Verified: ${file.name}`);
     }
 
+    this.isTransferring = false;
+    this.isPaused = false;
     this.events.onStatusChange('All files transferred and verified!');
   }
 
@@ -397,6 +472,8 @@ export class DropLinkEngine {
     this.pc = null;
     this.dataChannels = [];
     this.controlChannel = null;
+    this.activeSenderWorker?.terminate();
+    this.activeSenderWorker = null;
     this.startAckResolvers.clear();
     this.fileSavedResolvers.clear();
   }
