@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useRef, type ChangeEvent } from 'react';
+import { useState, useEffect, useRef, type ChangeEvent } from 'react';
 import QRCode from 'qrcode';
 import { DropLinkEngine, type ExtendedFile, type TransferMetrics } from './core/webrtc';
 import { downloadAllAsZip } from './core/zip';
@@ -60,7 +60,7 @@ export default function App() {
       console.warn('QR code generation failed:', err);
     }
 
-    const signalingUrl = import.meta.env.VITE_SIGNALING_URL || (window.location.port === '5173' ? 'http://localhost:3001' : window.location.origin);
+    const signalingUrl = import.meta.env.VITE_SIGNALING_URL || (window.location.origin);
 
     engineRef.current = new DropLinkEngine(
       signalingUrl,

@@ -1,4 +1,4 @@
-﻿import { getDefaultIceServers } from '../transport/ice';
+import { getDefaultIceServers } from '../transport/ice';
 import { io, Socket } from 'socket.io-client';
 import { unpackChunk, DEFAULT_CHUNK_SIZE } from '../engine/framing';
 import { decryptChunk, deriveKey } from '../engine/crypto';
@@ -48,7 +48,7 @@ export class DropLinkEngine {
 
   constructor(serverUrl: string, events: PeerEvents, password?: string) {
     this.events = events;
-    this.socket = io(serverUrl);
+    this.socket = io(serverUrl, { transports: ['polling'] });
 
     if (password && password.trim().length > 0) {
       const salt = new TextEncoder().encode('droplink2-static-salt-v1');
