@@ -1,4 +1,4 @@
-﻿import { Socket } from 'socket.io-client';
+import { Socket } from 'socket.io-client';
 import { rtcConfiguration } from '../transport/ice';
 
 export interface PeerNode {
@@ -73,11 +73,11 @@ export class MeshWebRTCManager {
       this.myPeerId = this.socket.id || '';
     });
 
-    this.socket.on('room-joined', ({ peerId, existingPeers }: { peerId: string; existingPeers: string[] }) => {
+    this.socket.on('room-joined', ({ peerId, existingPeers, isPolite }: { peerId: string; existingPeers: string[]; isPolite?: boolean }) => {
       this.myPeerId = peerId;
 
       existingPeers.forEach((remotePeerId) => {
-        this.setupPeer(remotePeerId, true);
+        this.setupPeer(remotePeerId, isPolite ?? true);
       });
       this.notifyPeersChanged();
     });

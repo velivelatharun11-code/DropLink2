@@ -1,4 +1,4 @@
-﻿import express from 'express';
+import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
@@ -79,6 +79,7 @@ io.on('connection', (socket) => {
       roomId,
       peerId: socket.id,
       existingPeers,
+      isPolite: true,
       maxPeers: MAX_PEERS_PER_ROOM
     });
 
