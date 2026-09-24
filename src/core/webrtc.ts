@@ -1,5 +1,6 @@
 import { Socket } from 'socket.io-client';
 import { rtcConfiguration } from '../transport/ice';
+import { encryptChunk, decryptChunk } from './crypto';
 
 export interface PeerNode {
   id: string;
@@ -37,11 +38,36 @@ export class MeshWebRTCManager {
   private readonly LOW_WATERMARK = 4 * 1024 * 1024; // 4 MB drain threshold
   private readonly STRIPE_COUNT = 4;
 
+  private encryptionKey: CryptoKey | null = null;
+  private isCurrentFileEncrypted: boolean = false;
+
   // Callbacks for UI updates
   public onPeersUpdated?: (peerIds: string[]) => void;
   public onProgress?: (progress: TransferProgress) => void;
   public onFileReceived?: (fileMeta: { id: string; name: string; size: number }) => void;
+  public onChatMessage?: (msg: { id: string; text: string; senderId: string; timestamp: number }) => void;
   public onError?: (error: string) => void;
+
+  public setEncryptionKey(key: CryptoKey | null) {
+    this.encryptionKey = key;
+  }
+
+  public sendChatMessage(text: string): { id: string; text: string; senderId: string; timestamp: number } {
+    const chatMsg = {
+      type: 'chat-message',
+      id: `${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      text,
+      senderId: this.myPeerId || 'self',
+      timestamp: Date.now()
+    };
+    const payload = JSON.stringify(chatMsg);
+    for (const peer of this.peers.values()) {
+      if (peer.controlChannel && peer.controlChannel.readyState === 'open') {
+        peer.controlChannel.send(payload);
+      }
+    }
+    return chatMsg;
+  }
 
   constructor(socket: Socket, worker?: Worker) {
     this.socket = socket;
@@ -242,7 +268,22 @@ export class MeshWebRTCManager {
     channel.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
-        if (message.type === 'file-header') {
+        if (message.type === 'chat-message') {
+          if (this.onChatMessage) {
+            this.onChatMessage({
+              id: message.id,
+              text: message.text,
+              senderId: message.senderId,
+              timestamp: message.timestamp
+            });
+          }
+        } else if (message.type === 'file-header') {
+          this.isCurrentFileEncrypted = !!message.isEncrypted;
+          if (message.isEncrypted && !this.encryptionKey) {
+            if (this.onError) {
+              this.onError('Received an encrypted file, but no room password is set.');
+            }
+          }
           if (this.opfsWorker) {
             this.opfsWorker.postMessage({
               type: 'INIT_FILE_STREAM',
@@ -259,6 +300,7 @@ export class MeshWebRTCManager {
             });
           }
         } else if (message.type === 'file-complete') {
+          this.isCurrentFileEncrypted = false;
           if (this.opfsWorker) {
             this.opfsWorker.postMessage({
               type: 'CLOSE_FILE_STREAM',
@@ -273,8 +315,20 @@ export class MeshWebRTCManager {
   }
 
   private attachStripeListeners(channel: RTCDataChannel, stripeIndex: number) {
-    channel.onmessage = (event) => {
-      const buffer = event.data as ArrayBuffer;
+    channel.onmessage = async (event) => {
+      let buffer = event.data as ArrayBuffer;
+
+      if (this.isCurrentFileEncrypted && this.encryptionKey) {
+        try {
+          buffer = await decryptChunk(buffer, this.encryptionKey);
+        } catch (err) {
+          console.error('[WebRTC Decrypt Error]', err);
+          if (this.onError) {
+            this.onError('Decryption failed: Incorrect room password or corrupt data.');
+          }
+          return;
+        }
+      }
 
       if (this.opfsWorker) {
         this.opfsWorker.postMessage(
@@ -300,7 +354,8 @@ export class MeshWebRTCManager {
       type: 'file-header',
       fileId,
       fileName: file.name,
-      fileSize: file.size
+      fileSize: file.size,
+      isEncrypted: !!this.encryptionKey
     });
 
     for (const peer of activePeers) {
@@ -320,7 +375,11 @@ export class MeshWebRTCManager {
 
       const sliceEnd = Math.min(offset + this.CHUNK_SIZE, file.size);
       const blobSlice = file.slice(offset, sliceEnd);
-      const chunkBuffer = await blobSlice.arrayBuffer();
+      let chunkBuffer = await blobSlice.arrayBuffer();
+
+      if (this.encryptionKey) {
+        chunkBuffer = await encryptChunk(chunkBuffer, this.encryptionKey);
+      }
 
       for (const peer of activePeers) {
         const channel = peer.stripes[stripeIndex];
