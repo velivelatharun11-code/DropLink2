@@ -35,6 +35,12 @@ function MainApp() {
   const [gateError, setGateError] = useState<string | null>(null);
   const [roomError, setRoomError] = useState<string | null>(null);
   const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
+  const [occupancy, setOccupancy] = useState<number>(1);
+  const [transferLock, setTransferLock] = useState<{
+    isLocked: boolean;
+    senderId: string | null;
+    senderName: string | null;
+  } | null>(null);
   const [copied, setCopied] = useState(false);
 
   // File Transfer State
@@ -108,13 +114,54 @@ function MainApp() {
       setConnectedPeers(peerIds);
     };
 
-    rtc.onRoomJoined = ({ roomId: joinedRoom, isProtected }) => {
+    rtc.onRoomJoined = ({ roomId: joinedRoom, isProtected, occupancy: occ, transferLock: lock }) => {
       setIsJoined(true);
       setIsRoomProtected(isProtected);
       setGateError(null);
       setRoomError(null);
       setRoomId(joinedRoom);
+      if (typeof occ === 'number') {
+        setOccupancy(occ);
+      }
+      if (lock && lock.isLocked) {
+        setTransferLock(lock);
+      } else {
+        setTransferLock(null);
+      }
       window.location.hash = joinedRoom;
+    };
+
+    rtc.onPeerJoined = (data) => {
+      if (typeof data.occupancy === 'number') {
+        setOccupancy(data.occupancy);
+      }
+      if (data.transferLock) {
+        setTransferLock(data.transferLock.isLocked ? data.transferLock : null);
+      }
+    };
+
+    rtc.onPeerLeft = (data) => {
+      if (typeof data.occupancy === 'number') {
+        setOccupancy(data.occupancy);
+      }
+    };
+
+    rtc.onOccupancyUpdated = (data) => {
+      if (typeof data.occupancy === 'number') {
+        setOccupancy(data.occupancy);
+      }
+    };
+
+    rtc.onTransferLockAcquired = (data) => {
+      setTransferLock({
+        isLocked: true,
+        senderId: data.senderId,
+        senderName: data.senderName
+      });
+    };
+
+    rtc.onTransferLockReleased = () => {
+      setTransferLock(null);
     };
 
     rtc.onAuthRequired = (data) => {
@@ -237,6 +284,8 @@ function MainApp() {
     }
   };
 
+  const isLockedByOther = !!(transferLock?.isLocked && transferLock.senderId !== socketRef.current?.id);
+
   const handleLeaveRoom = () => {
     if (rtcManagerRef.current) {
       rtcManagerRef.current.leaveRoom();
@@ -246,6 +295,10 @@ function MainApp() {
     setRoomPassword('');
     setIsRoomProtected(false);
     setConnectedPeers([]);
+    setOccupancy(1);
+    setTransferLock(null);
+    setSelectedFiles([]);
+    setIsTransferring(false);
     setGateError(null);
     window.location.hash = '';
   };
@@ -283,6 +336,15 @@ function MainApp() {
 
   const handleStartBroadcast = async () => {
     if (selectedFiles.length === 0 || !rtcManagerRef.current) return;
+    if (occupancy < 2 || isLockedByOther) return;
+
+    // 1. Acquire mutual exclusion transfer lock from signaling server
+    const lockRes = await rtcManagerRef.current.acquireTransferLock();
+    if (!lockRes.success) {
+      setRoomError(lockRes.error || 'Transmission is locked by another peer.');
+      return;
+    }
+
     try {
       setIsTransferring(true);
       setRoomError(null);
@@ -296,6 +358,12 @@ function MainApp() {
     } finally {
       setIsTransferring(false);
       setCurrentBroadcastIndex(0);
+      // 2. Release mutual exclusion transfer lock
+      try {
+        await rtcManagerRef.current.releaseTransferLock();
+      } catch (e) {
+        console.error('Error releasing transfer lock:', e);
+      }
     }
   };
 
@@ -399,15 +467,21 @@ function MainApp() {
             </button>
           )}
 
-          {/* Peer Count Badge */}
+          {/* Peer / Participant Count Badge */}
           {isJoined && (
-            <div className="px-3 py-1.5 rounded-full text-xs font-semibold border flex items-center gap-1.5 border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/60">
+            <div className="px-3 py-1.5 rounded-full text-xs font-semibold border flex items-center gap-1.5 border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/60 shadow-sm">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  connectedPeers.length > 0 ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+                  occupancy >= 2 ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
                 }`}
               />
-              <span>{connectedPeers.length}/5 Peers</span>
+              <span className="font-medium">
+                {occupancy === 1
+                  ? '1/5 in Room (Waiting for receivers)'
+                  : occupancy >= 5
+                  ? '5/5 in Room (Full)'
+                  : `${occupancy}/5 in Room`}
+              </span>
             </div>
           )}
 
@@ -455,8 +529,8 @@ function MainApp() {
                       #{roomId}
                     </span>
                     <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 rounded-full text-[11px] font-semibold">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                      Active Mesh
+                      <span className={`w-1.5 h-1.5 rounded-full ${occupancy >= 2 ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+                      {occupancy >= 2 ? `Active Mesh (${occupancy}/5)` : 'Waiting for receivers (1/5)'}
                     </span>
                     {roomPassword && (
                       <span className="inline-flex items-center gap-1 px-2.5 py-0.5 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 rounded-full text-[11px] font-semibold">
@@ -501,7 +575,7 @@ function MainApp() {
             </section>
 
             {uploadProgress && (
-              <TransferProgress progress={uploadProgress} direction="upload" />
+              <TransferProgress progress={uploadProgress} direction={isTransferring ? "upload" : "download"} />
             )}
 
             {/* Dispatch File Section */}
@@ -512,16 +586,24 @@ function MainApp() {
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={isTransferring}
-                    className="px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
+                    disabled={isTransferring || isLockedByOther}
+                    className={`px-3.5 py-1.5 rounded-xl border text-xs font-semibold transition ${
+                      isTransferring || isLockedByOther
+                        ? 'bg-slate-100 dark:bg-slate-800/40 text-slate-400 border-slate-200 dark:border-slate-800 cursor-not-allowed'
+                        : 'bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700 cursor-pointer'
+                    }`}
                   >
                     Select Files
                   </button>
                   <button
                     type="button"
                     onClick={() => folderInputRef.current?.click()}
-                    disabled={isTransferring}
-                    className="px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
+                    disabled={isTransferring || isLockedByOther}
+                    className={`px-3.5 py-1.5 rounded-xl border text-xs font-semibold transition ${
+                      isTransferring || isLockedByOther
+                        ? 'bg-slate-100 dark:bg-slate-800/40 text-slate-400 border-slate-200 dark:border-slate-800 cursor-not-allowed'
+                        : 'bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700 cursor-pointer'
+                    }`}
                   >
                     Select Folder
                   </button>
@@ -536,7 +618,7 @@ function MainApp() {
                 multiple
                 className="hidden"
                 onChange={handleFileInputChange}
-                disabled={isTransferring}
+                disabled={isTransferring || isLockedByOther}
               />
               <input
                 ref={folderInputRef}
@@ -545,27 +627,34 @@ function MainApp() {
                 className="hidden"
                 {...({ webkitdirectory: '', directory: '' } as any)}
                 onChange={handleFolderInputChange}
-                disabled={isTransferring}
+                disabled={isTransferring || isLockedByOther}
               />
 
               {/* Dropzone */}
               <div
-                onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                onDragOver={(e) => {
+                  if (isLockedByOther) return;
+                  e.preventDefault();
+                  setIsDragging(true);
+                }}
                 onDragLeave={() => setIsDragging(false)}
                 onDrop={(e) => {
+                  if (isLockedByOther) return;
                   e.preventDefault();
                   setIsDragging(false);
                   if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
                     setSelectedFiles(Array.from(e.dataTransfer.files));
                   }
                 }}
-                className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors cursor-pointer ${
-                  isDragging
-                    ? 'border-indigo-500 bg-indigo-50/50 dark:bg-indigo-950/30'
-                    : 'border-slate-300 dark:border-slate-700 hover:border-indigo-500'
+                className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors ${
+                  isLockedByOther
+                    ? 'border-slate-200 dark:border-slate-800 opacity-60 cursor-not-allowed pointer-events-none'
+                    : isDragging
+                    ? 'border-indigo-500 bg-indigo-50/50 dark:bg-indigo-950/30 cursor-pointer'
+                    : 'border-slate-300 dark:border-slate-700 hover:border-indigo-500 cursor-pointer'
                 }`}
                 onClick={() => {
-                  if (selectedFiles.length === 0) fileInputRef.current?.click();
+                  if (!isLockedByOther && selectedFiles.length === 0) fileInputRef.current?.click();
                 }}
               >
                 <div className="flex flex-col items-center space-y-2">
@@ -623,52 +712,73 @@ function MainApp() {
               )}
 
               {/* Action Row */}
-              <div className="flex items-center justify-between pt-2">
-                <div className="flex items-center gap-3">
-                  {selectedFiles.length === 1 && (
+              {isLockedByOther ? (
+                <div className="w-full p-4 rounded-xl border border-amber-300 dark:border-amber-800/80 bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 text-xs sm:text-sm font-semibold flex items-center justify-center gap-2.5 shadow-sm animate-pulse">
+                  <span className="text-base sm:text-lg">🔒</span>
+                  <span>
+                    {transferLock?.senderName || 'Another peer'} is actively broadcasting. Transmission is locked for others until this transfer completes...
+                  </span>
+                </div>
+              ) : (
+                <div className="flex items-center justify-between pt-2">
+                  <div className="flex items-center gap-3">
+                    {selectedFiles.length === 1 && (
+                      <button
+                        type="button"
+                        onClick={() => openPreview({
+                          name: selectedFiles[0].name,
+                          size: selectedFiles[0].size,
+                          blob: selectedFiles[0],
+                          type: selectedFiles[0].type
+                        })}
+                        className="text-xs font-semibold text-indigo-600 dark:text-indigo-400 hover:underline cursor-pointer"
+                      >
+                        Preview Selected File
+                      </button>
+                    )}
+                    {selectedFiles.length > 0 && !isTransferring && (
+                      <button
+                        type="button"
+                        onClick={() => setSelectedFiles([])}
+                        className="text-xs font-semibold text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 cursor-pointer"
+                      >
+                        Clear Selection
+                      </button>
+                    )}
+                  </div>
+
+                  {occupancy < 2 ? (
                     <button
                       type="button"
-                      onClick={() => openPreview({
-                        name: selectedFiles[0].name,
-                        size: selectedFiles[0].size,
-                        blob: selectedFiles[0],
-                        type: selectedFiles[0].type
-                      })}
-                      className="text-xs font-semibold text-indigo-600 dark:text-indigo-400 hover:underline cursor-pointer"
+                      disabled
+                      className="ml-auto px-6 py-2.5 rounded-xl text-xs sm:text-sm font-semibold bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed shadow-none"
                     >
-                      Preview Selected File
+                      Waiting for peers to join (At least 1 receiver required)
                     </button>
-                  )}
-                  {selectedFiles.length > 0 && !isTransferring && (
+                  ) : (
                     <button
                       type="button"
-                      onClick={() => setSelectedFiles([])}
-                      className="text-xs font-semibold text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 cursor-pointer"
+                      onClick={handleStartBroadcast}
+                      disabled={selectedFiles.length === 0 || isTransferring}
+                      className={`ml-auto px-6 py-2.5 rounded-xl text-sm font-semibold shadow-md transition ${
+                        selectedFiles.length === 0 || isTransferring
+                          ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed shadow-none'
+                          : 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer'
+                      }`}
                     >
-                      Clear Selection
+                      {isTransferring
+                        ? selectedFiles.length > 1
+                          ? `Broadcasting (${currentBroadcastIndex + 1}/${selectedFiles.length})...`
+                          : 'Broadcasting...'
+                        : selectedFiles.length === 0
+                        ? 'Select Files to Broadcast'
+                        : selectedFiles.length > 1
+                        ? `Broadcast ${selectedFiles.length} Files to ${occupancy - 1} Peer(s)`
+                        : `Broadcast to ${occupancy - 1} Peer(s)`}
                     </button>
                   )}
                 </div>
-
-                <button
-                  type="button"
-                  onClick={handleStartBroadcast}
-                  disabled={selectedFiles.length === 0 || connectedPeers.length === 0 || isTransferring}
-                  className={`ml-auto px-6 py-2.5 rounded-xl text-sm font-semibold shadow-md transition ${
-                    selectedFiles.length === 0 || connectedPeers.length === 0 || isTransferring
-                      ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
-                      : 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer'
-                  }`}
-                >
-                  {isTransferring
-                    ? selectedFiles.length > 1
-                      ? `Broadcasting (${currentBroadcastIndex + 1}/${selectedFiles.length})...`
-                      : 'Broadcasting...'
-                    : selectedFiles.length > 1
-                    ? `Broadcast ${selectedFiles.length} Files to ${connectedPeers.length} Peer(s)`
-                    : `Broadcast to ${connectedPeers.length} Peer(s)`}
-                </button>
-              </div>
+              )}
             </section>
 
             {/* Received Files List */}

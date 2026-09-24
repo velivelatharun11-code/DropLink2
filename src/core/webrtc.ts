@@ -12,6 +12,7 @@ export interface PeerNode {
   controlChannel: RTCDataChannel;
   stripes: RTCDataChannel[];
   connected: boolean;
+  candidateQueue: RTCIceCandidateInit[];
 }
 
 export interface TransferProgress {
@@ -41,6 +42,16 @@ export class MeshWebRTCManager {
   private encryptionKey: CryptoKey | null = null;
   private isCurrentFileEncrypted: boolean = false;
 
+  // Incoming transfer telemetry tracker for receiver
+  private incomingTransfer: {
+    fileId: string;
+    fileName: string;
+    totalBytes: number;
+    receivedBytes: number;
+    startTime: number;
+    lastProgressUpdate: number;
+  } | null = null;
+
   // Callbacks for UI updates
   public onPeersUpdated?: (peerIds: string[]) => void;
   public onProgress?: (progress: TransferProgress) => void;
@@ -48,7 +59,12 @@ export class MeshWebRTCManager {
   public onChatMessage?: (msg: { id: string; text: string; senderId: string; timestamp: number }) => void;
   public onAuthRequired?: (data: { roomId: string; message: string }) => void;
   public onAuthFailed?: (data: { roomId: string; message: string }) => void;
-  public onRoomJoined?: (data: { roomId: string; peerId: string; isProtected: boolean }) => void;
+  public onRoomJoined?: (data: { roomId: string; peerId: string; isProtected: boolean; occupancy?: number; transferLock?: any }) => void;
+  public onPeerJoined?: (data: { peerId: string; peerName?: string; occupancy?: number; transferLock?: any }) => void;
+  public onPeerLeft?: (data: { peerId: string; occupancy?: number }) => void;
+  public onOccupancyUpdated?: (data: { occupancy: number; maxPeers: number; roomId?: string }) => void;
+  public onTransferLockAcquired?: (data: { senderId: string; senderName: string }) => void;
+  public onTransferLockReleased?: (data: { releasedBy: string; reason?: string }) => void;
   public onError?: (error: string) => void;
 
   public setEncryptionKey(key: CryptoKey | null) {
@@ -86,6 +102,10 @@ export class MeshWebRTCManager {
     return this.roomId;
   }
 
+  public getMyPeerId(): string {
+    return this.myPeerId;
+  }
+
   public getConnectedPeerIds(): string[] {
     return Array.from(this.peers.entries())
       .filter(([, peer]) => peer.connected)
@@ -99,15 +119,32 @@ export class MeshWebRTCManager {
     Array.from(this.peers.keys()).forEach((peerId) => this.teardownPeer(peerId));
     this.peers.clear();
     this.roomId = '';
+    this.incomingTransfer = null;
     this.notifyPeersChanged();
   }
 
-  public initRoom(roomId: string, password?: string) {
+  public initRoom(roomId: string, password?: string, peerName?: string) {
     if (this.roomId && this.roomId !== roomId) {
       this.leaveRoom();
     }
     this.roomId = roomId;
-    this.socket.emit('join-room', { roomId, password });
+    this.socket.emit('join-room', { roomId, password, peerName });
+  }
+
+  public acquireTransferLock(): Promise<{ success: boolean; lock?: any; error?: string }> {
+    return new Promise((resolve) => {
+      this.socket.emit('acquire-transfer-lock', (res: any) => {
+        resolve(res || { success: false, error: 'Signaling server did not respond' });
+      });
+    });
+  }
+
+  public releaseTransferLock(): Promise<boolean> {
+    return new Promise((resolve) => {
+      this.socket.emit('release-transfer-lock', (res: any) => {
+        resolve(!!res?.success);
+      });
+    });
   }
 
   private registerSignalingEvents() {
@@ -131,31 +168,75 @@ export class MeshWebRTCManager {
       }
     });
 
-    this.socket.on('room-joined', ({ peerId, existingPeers, isPolite, isProtected }: { peerId: string; existingPeers: string[]; isPolite?: boolean; isProtected?: boolean }) => {
-      this.myPeerId = peerId;
+    this.socket.on('room-joined', (data: {
+      roomId: string;
+      peerId: string;
+      existingPeers: string[];
+      isPolite?: boolean;
+      isProtected?: boolean;
+      occupancy?: number;
+      transferLock?: any;
+    }) => {
+      this.myPeerId = data.peerId;
 
-      existingPeers.forEach((remotePeerId) => {
-        this.setupPeer(remotePeerId, isPolite ?? true);
+      data.existingPeers.forEach((remotePeerId) => {
+        // Joining peer is polite
+        this.setupPeer(remotePeerId, data.isPolite ?? true);
       });
       this.notifyPeersChanged();
 
       if (this.onRoomJoined) {
-        this.onRoomJoined({ roomId: this.roomId, peerId, isProtected: !!isProtected });
+        this.onRoomJoined({
+          roomId: this.roomId,
+          peerId: data.peerId,
+          isProtected: !!data.isProtected,
+          occupancy: data.occupancy || 1,
+          transferLock: data.transferLock
+        });
       }
     });
 
-    this.socket.on('peer-joined', ({ peerId }: { peerId: string }) => {
-      this.setupPeer(peerId, false);
+    this.socket.on('peer-joined', (data: { peerId: string; peerName?: string; occupancy?: number; transferLock?: any }) => {
+      // Existing peer is impolite (initiator)
+      const peerNode = this.setupPeer(data.peerId, false);
       this.notifyPeersChanged();
+
+      // Automatically trigger initial offer negotiation immediately post-auth
+      this.initiateOffer(peerNode);
+
+      if (this.onPeerJoined) {
+        this.onPeerJoined(data);
+      }
     });
 
     this.socket.on('signal', async ({ senderPeerId, signal }: { senderPeerId: string; signal: any }) => {
       await this.handleIncomingSignal(senderPeerId, signal);
     });
 
-    this.socket.on('peer-left', ({ peerId }: { peerId: string }) => {
-      this.teardownPeer(peerId);
+    this.socket.on('peer-left', (data: { peerId: string; occupancy?: number }) => {
+      this.teardownPeer(data.peerId);
       this.notifyPeersChanged();
+      if (this.onPeerLeft) {
+        this.onPeerLeft(data);
+      }
+    });
+
+    this.socket.on('room-occupancy-update', (data: { occupancy: number; maxPeers: number; roomId?: string }) => {
+      if (this.onOccupancyUpdated) {
+        this.onOccupancyUpdated(data);
+      }
+    });
+
+    this.socket.on('transfer-lock-acquired', (data: { senderId: string; senderName: string }) => {
+      if (this.onTransferLockAcquired) {
+        this.onTransferLockAcquired(data);
+      }
+    });
+
+    this.socket.on('transfer-lock-released', (data: { releasedBy: string; reason?: string }) => {
+      if (this.onTransferLockReleased) {
+        this.onTransferLockReleased(data);
+      }
     });
 
     this.socket.on('room-full', ({ message }: { message: string }) => {
@@ -198,24 +279,64 @@ export class MeshWebRTCManager {
       isSettingRemoteAnswerPending: false,
       controlChannel,
       stripes,
-      connected: false
+      connected: false,
+      candidateQueue: []
     };
 
     this.peers.set(remotePeerId, peerNode);
 
+    // Fast connection readiness tracking across data channels & pc states
+    const updateConnectedStatus = () => {
+      const channelsReady =
+        controlChannel.readyState === 'open' &&
+        stripes.every((s) => s.readyState === 'open');
+      const pcReady = pc.connectionState === 'connected';
+
+      const isNowConnected = channelsReady || pcReady;
+      if (peerNode.connected !== isNowConnected) {
+        peerNode.connected = isNowConnected;
+        this.notifyPeersChanged();
+      }
+    };
+
+    controlChannel.onopen = updateConnectedStatus;
+    controlChannel.onclose = updateConnectedStatus;
+
+    stripes.forEach((stripe) => {
+      stripe.onopen = updateConnectedStatus;
+      stripe.onclose = updateConnectedStatus;
+    });
+
     this.attachControlListeners(controlChannel);
-    this.attachPeerConnectionListeners(peerNode);
+    this.attachPeerConnectionListeners(peerNode, updateConnectedStatus);
 
     return peerNode;
   }
 
-  private attachPeerConnectionListeners(peer: PeerNode) {
+  private async initiateOffer(peer: PeerNode) {
+    try {
+      peer.makingOffer = true;
+      const offer = await peer.pc.createOffer();
+      await peer.pc.setLocalDescription(offer);
+      this.socket.emit('signal', {
+        targetPeerId: peer.id,
+        signal: { description: peer.pc.localDescription }
+      });
+    } catch (err) {
+      console.error(`[WebRTC] Failed to initiate offer for ${peer.id}:`, err);
+    } finally {
+      peer.makingOffer = false;
+    }
+  }
+
+  private attachPeerConnectionListeners(peer: PeerNode, onConnectionChange: () => void) {
     const { pc, id } = peer;
 
     pc.onnegotiationneeded = async () => {
       try {
         peer.makingOffer = true;
-        await pc.setLocalDescription();
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
         this.socket.emit('signal', {
           targetPeerId: id,
           signal: { description: pc.localDescription }
@@ -237,8 +358,7 @@ export class MeshWebRTCManager {
     };
 
     pc.onconnectionstatechange = () => {
-      peer.connected = pc.connectionState === 'connected';
-      this.notifyPeersChanged();
+      onConnectionChange();
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         this.teardownPeer(id);
       }
@@ -257,9 +377,8 @@ export class MeshWebRTCManager {
     try {
       if (signal.description) {
         const description = signal.description;
-        const offerCollision =
-          description.type === 'offer' &&
-          (peer.makingOffer || pc.signalingState !== 'stable');
+        const readyForOffer = !peer.makingOffer && (pc.signalingState === 'stable' || peer.isSettingRemoteAnswerPending);
+        const offerCollision = description.type === 'offer' && !readyForOffer;
 
         peer.ignoreOffer = !peer.isPolite && offerCollision;
         if (peer.ignoreOffer) {
@@ -270,20 +389,37 @@ export class MeshWebRTCManager {
         await pc.setRemoteDescription(description);
         peer.isSettingRemoteAnswerPending = false;
 
+        // Drain queued ICE candidates
+        if (peer.candidateQueue.length > 0) {
+          for (const cand of peer.candidateQueue) {
+            try {
+              await pc.addIceCandidate(cand);
+            } catch (err) {
+              console.warn('[WebRTC] Candidate queue drain error:', err);
+            }
+          }
+          peer.candidateQueue = [];
+        }
+
         if (description.type === 'offer') {
-          await pc.setLocalDescription();
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
           this.socket.emit('signal', {
             targetPeerId: senderId,
             signal: { description: pc.localDescription }
           });
         }
       } else if (signal.candidate) {
-        try {
-          await pc.addIceCandidate(signal.candidate);
-        } catch (err) {
-          if (!peer.ignoreOffer) {
-            console.error(`[WebRTC] Candidate error for peer ${senderId}:`, err);
+        if (pc.remoteDescription && pc.remoteDescription.type) {
+          try {
+            await pc.addIceCandidate(signal.candidate);
+          } catch (err) {
+            if (!peer.ignoreOffer) {
+              console.error(`[WebRTC] Candidate error for peer ${senderId}:`, err);
+            }
           }
+        } else {
+          peer.candidateQueue.push(signal.candidate);
         }
       }
     } catch (err) {
@@ -311,6 +447,14 @@ export class MeshWebRTCManager {
               this.onError('Received an encrypted file, but no room password is set.');
             }
           }
+          this.incomingTransfer = {
+            fileId: message.fileId,
+            fileName: message.fileName,
+            totalBytes: message.fileSize,
+            receivedBytes: 0,
+            startTime: performance.now(),
+            lastProgressUpdate: performance.now()
+          };
           if (this.opfsWorker) {
             this.opfsWorker.postMessage({
               type: 'INIT_FILE_STREAM',
@@ -329,6 +473,21 @@ export class MeshWebRTCManager {
           }
         } else if (message.type === 'file-complete') {
           this.isCurrentFileEncrypted = false;
+          if (this.incomingTransfer) {
+            if (this.onProgress) {
+              this.onProgress({
+                fileId: this.incomingTransfer.fileId,
+                fileName: this.incomingTransfer.fileName,
+                totalBytes: this.incomingTransfer.totalBytes,
+                transferredBytes: this.incomingTransfer.totalBytes,
+                speedBps: 0,
+                percentage: 100,
+                activeStripes: [0, 1, 2, 3],
+                connectedPeersCount: this.getConnectedPeerIds().length
+              });
+            }
+            this.incomingTransfer = null;
+          }
           if (this.opfsWorker) {
             this.opfsWorker.postMessage({
               type: 'CLOSE_FILE_STREAM',
@@ -355,6 +514,36 @@ export class MeshWebRTCManager {
             this.onError('Decryption failed: Incorrect room password or corrupt data.');
           }
           return;
+        }
+      }
+
+      if (this.incomingTransfer) {
+        this.incomingTransfer.receivedBytes += buffer.byteLength;
+        const now = performance.now();
+        if (
+          now - this.incomingTransfer.lastProgressUpdate > 30 ||
+          this.incomingTransfer.receivedBytes >= this.incomingTransfer.totalBytes
+        ) {
+          const elapsedSec = (now - this.incomingTransfer.startTime) / 1000;
+          const speedBps = elapsedSec > 0 ? this.incomingTransfer.receivedBytes / elapsedSec : 0;
+          const percentage = Math.min(
+            100,
+            Math.round((this.incomingTransfer.receivedBytes / this.incomingTransfer.totalBytes) * 100)
+          );
+
+          if (this.onProgress) {
+            this.onProgress({
+              fileId: this.incomingTransfer.fileId,
+              fileName: this.incomingTransfer.fileName,
+              totalBytes: this.incomingTransfer.totalBytes,
+              transferredBytes: this.incomingTransfer.receivedBytes,
+              speedBps,
+              percentage,
+              activeStripes: [stripeIndex],
+              connectedPeersCount: this.getConnectedPeerIds().length
+            });
+          }
+          this.incomingTransfer.lastProgressUpdate = now;
         }
       }
 
