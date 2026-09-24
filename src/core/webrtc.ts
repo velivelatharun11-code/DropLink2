@@ -1,16 +1,31 @@
 import { Socket } from 'socket.io-client';
-import { rtcConfiguration } from '../transport/ice';
+import { ICE_SERVERS } from '../transport/ice';
 import { encryptChunk, decryptChunk } from './crypto';
+
+export { ICE_SERVERS };
+
+export type PeerConnectionStatus = 'connecting' | 'connected' | 'failed';
+
+export interface PeerDiagnosticInfo {
+  peerId: string;
+  peerName?: string;
+  status: PeerConnectionStatus;
+  iceState: RTCIceConnectionState;
+  connectionState: RTCPeerConnectionState;
+  openChannelsCount: number;
+  totalChannelsCount: number;
+}
 
 export interface PeerNode {
   id: string;
+  name?: string;
   pc: RTCPeerConnection;
   isPolite: boolean;
   makingOffer: boolean;
   ignoreOffer: boolean;
   isSettingRemoteAnswerPending: boolean;
-  controlChannel: RTCDataChannel;
-  stripes: RTCDataChannel[];
+  controlChannel: RTCDataChannel | null;
+  stripes: (RTCDataChannel | null)[];
   connected: boolean;
   candidateQueue: RTCIceCandidateInit[];
 }
@@ -54,6 +69,9 @@ export class MeshWebRTCManager {
 
   // Callbacks for UI updates
   public onPeersUpdated?: (peerIds: string[]) => void;
+  public onPeerConnected?: (peerId: string) => void;
+  public onPeerDisconnected?: (peerId: string) => void;
+  public onPeerDiagnosticsUpdated?: (diagnostics: PeerDiagnosticInfo[]) => void;
   public onProgress?: (progress: TransferProgress) => void;
   public onFileReceived?: (fileMeta: { id: string; name: string; size: number }) => void;
   public onChatMessage?: (msg: { id: string; text: string; senderId: string; timestamp: number }) => void;
@@ -246,32 +264,102 @@ export class MeshWebRTCManager {
     });
   }
 
-  private setupPeer(remotePeerId: string, isPolite: boolean): PeerNode {
+  public getPeerDiagnostics(): PeerDiagnosticInfo[] {
+    return Array.from(this.peers.values()).map((peer) => {
+      const openControl = peer.controlChannel && peer.controlChannel.readyState === 'open' ? 1 : 0;
+      const openStripes = peer.stripes.filter((s) => s && s.readyState === 'open').length;
+      const openChannelsCount = openControl + openStripes;
+
+      let status: PeerConnectionStatus = 'connecting';
+      const isFailed =
+        peer.pc.connectionState === 'failed' ||
+        peer.pc.iceConnectionState === 'failed';
+
+      if (isFailed) {
+        status = 'failed';
+      } else if (openChannelsCount >= 5 || (openControl === 1 && peer.connected)) {
+        status = 'connected';
+      }
+
+      return {
+        peerId: peer.id,
+        peerName: peer.name,
+        status,
+        iceState: peer.pc.iceConnectionState,
+        connectionState: peer.pc.connectionState,
+        openChannelsCount,
+        totalChannelsCount: this.STRIPE_COUNT + 1
+      };
+    });
+  }
+
+  private notifyDiagnosticsChanged() {
+    if (this.onPeerDiagnosticsUpdated) {
+      this.onPeerDiagnosticsUpdated(this.getPeerDiagnostics());
+    }
+  }
+
+  public retryPeer(peerId: string): void {
+    const existing = this.peers.get(peerId);
+    const peerName = existing?.name;
+    const isPolite = existing ? existing.isPolite : true;
+
+    this.teardownPeer(peerId);
+
+    const newPeer = this.setupPeer(peerId, isPolite, peerName);
+    this.notifyPeersChanged();
+    this.notifyDiagnosticsChanged();
+
+    if (!isPolite) {
+      this.initiateOffer(newPeer);
+    } else {
+      this.socket.emit('signal', {
+        targetPeerId: peerId,
+        signal: { type: 'renegotiate-request' }
+      });
+    }
+  }
+
+  private setupPeer(remotePeerId: string, isPolite: boolean, peerName?: string): PeerNode {
     if (this.peers.has(remotePeerId)) {
-      return this.peers.get(remotePeerId)!;
+      const existing = this.peers.get(remotePeerId)!;
+      if (peerName) existing.name = peerName;
+      return existing;
     }
 
-    const pc = new RTCPeerConnection(rtcConfiguration);
+    const pc = new RTCPeerConnection(ICE_SERVERS);
 
-    const controlChannel = pc.createDataChannel('control', {
-      negotiated: true,
-      id: 0
-    });
-    controlChannel.binaryType = 'arraybuffer';
+    let controlChannel: RTCDataChannel | null = null;
+    const stripes: (RTCDataChannel | null)[] = [];
 
-    const stripes: RTCDataChannel[] = [];
-    for (let i = 0; i < this.STRIPE_COUNT; i++) {
-      const stripe = pc.createDataChannel(`stripe-${i}`, {
-        negotiated: true,
-        id: i + 1
-      });
-      stripe.binaryType = 'arraybuffer';
-      this.attachStripeListeners(stripe, i);
-      stripes.push(stripe);
+    // The designated offerer (isPolite === false) explicitly pre-creates control (id: 0) and 4 stripes (id: 1..4)
+    if (!isPolite) {
+      try {
+        controlChannel = pc.createDataChannel('control');
+        controlChannel.binaryType = 'arraybuffer';
+      } catch (e) {
+        console.error('[WebRTC] Failed to pre-create control channel:', e);
+      }
+
+      for (let i = 0; i < this.STRIPE_COUNT; i++) {
+        try {
+          const stripe = pc.createDataChannel(`stripe-${i}`);
+          stripe.binaryType = 'arraybuffer';
+          stripes.push(stripe);
+        } catch (e) {
+          console.error(`[WebRTC] Failed to pre-create stripe-${i}:`, e);
+          stripes.push(null);
+        }
+      }
+    } else {
+      for (let i = 0; i < this.STRIPE_COUNT; i++) {
+        stripes.push(null);
+      }
     }
 
     const peerNode: PeerNode = {
       id: remotePeerId,
+      name: peerName || `Device-${remotePeerId.substring(0, 4).toUpperCase()}`,
       pc,
       isPolite,
       makingOffer: false,
@@ -287,27 +375,85 @@ export class MeshWebRTCManager {
 
     // Fast connection readiness tracking across data channels & pc states
     const updateConnectedStatus = () => {
-      const channelsReady =
-        controlChannel.readyState === 'open' &&
-        stripes.every((s) => s.readyState === 'open');
-      const pcReady = pc.connectionState === 'connected';
+      const openControl = peerNode.controlChannel && peerNode.controlChannel.readyState === 'open';
+      const openStripes = peerNode.stripes.filter((s) => s && s.readyState === 'open').length;
+      const pcReady =
+        pc.connectionState === 'connected' ||
+        pc.iceConnectionState === 'connected' ||
+        pc.iceConnectionState === 'completed';
 
-      const isNowConnected = channelsReady || pcReady;
+      // Remote peer is considered connected when control channel is open and communication is active
+      const isNowConnected = Boolean(openControl && (openStripes >= 1 || pcReady));
+
       if (peerNode.connected !== isNowConnected) {
         peerNode.connected = isNowConnected;
+        if (isNowConnected) {
+          if (this.onPeerConnected) {
+            this.onPeerConnected(remotePeerId);
+          }
+        } else {
+          if (this.onPeerDisconnected) {
+            this.onPeerDisconnected(remotePeerId);
+          }
+        }
         this.notifyPeersChanged();
       }
+
+      this.notifyDiagnosticsChanged();
     };
 
-    controlChannel.onopen = updateConnectedStatus;
-    controlChannel.onclose = updateConnectedStatus;
+    // The answerer on datachannel event attaches listeners to all received lanes
+    pc.ondatachannel = (event) => {
+      const channel = event.channel;
+      channel.binaryType = 'arraybuffer';
 
-    stripes.forEach((stripe) => {
-      stripe.onopen = updateConnectedStatus;
-      stripe.onclose = updateConnectedStatus;
+      const cId = channel.id ?? -1;
+      if (channel.label === 'control' || cId === 0) {
+        peerNode.controlChannel = channel;
+        this.attachControlListeners(channel);
+        channel.onopen = updateConnectedStatus;
+        channel.onclose = updateConnectedStatus;
+        channel.onerror = updateConnectedStatus;
+      } else if (channel.label.startsWith('stripe-') || (cId >= 1 && cId <= this.STRIPE_COUNT)) {
+        const idx = channel.label.startsWith('stripe-')
+          ? parseInt(channel.label.replace('stripe-', ''), 10)
+          : cId - 1;
+        peerNode.stripes[idx] = channel;
+        this.attachStripeListeners(channel, idx);
+        channel.onopen = updateConnectedStatus;
+        channel.onclose = updateConnectedStatus;
+        channel.onerror = updateConnectedStatus;
+      }
+
+      updateConnectedStatus();
+    };
+
+    // Attach listeners on offerer-created channels
+    if (controlChannel) {
+      this.attachControlListeners(controlChannel);
+      controlChannel.onopen = updateConnectedStatus;
+      controlChannel.onclose = updateConnectedStatus;
+      controlChannel.onerror = updateConnectedStatus;
+    }
+
+    stripes.forEach((stripe, i) => {
+      if (stripe) {
+        this.attachStripeListeners(stripe, i);
+        stripe.onopen = updateConnectedStatus;
+        stripe.onclose = updateConnectedStatus;
+        stripe.onerror = updateConnectedStatus;
+      }
     });
 
-    this.attachControlListeners(controlChannel);
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'failed') {
+        try {
+          pc.restartIce();
+        } catch {}
+      }
+      updateConnectedStatus();
+    };
+
     this.attachPeerConnectionListeners(peerNode, updateConnectedStatus);
 
     return peerNode;
@@ -365,11 +511,17 @@ export class MeshWebRTCManager {
     };
   }
 
-  private async handleIncomingSignal(senderId: string, signal: { description?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }) {
+  private async handleIncomingSignal(senderId: string, signal: { description?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit; type?: string }) {
     let peer = this.peers.get(senderId);
     if (!peer) {
       const isPolite = this.myPeerId > senderId;
       peer = this.setupPeer(senderId, isPolite);
+    }
+
+    if (signal.type === 'renegotiate-request') {
+      console.log(`[WebRTC] Received renegotiation request from ${senderId}, initiating fresh offer...`);
+      this.initiateOffer(peer);
+      return;
     }
 
     const { pc } = peer;
@@ -561,7 +713,9 @@ export class MeshWebRTCManager {
   }
 
   public async streamFileToAllPeers(file: File): Promise<void> {
-    const activePeers = Array.from(this.peers.values()).filter((p) => p.connected);
+    const activePeers = Array.from(this.peers.values()).filter(
+      (p) => p.connected && p.controlChannel && p.controlChannel.readyState === 'open'
+    );
     if (activePeers.length === 0) {
       throw new Error('No connected peers in room to stream file.');
     }
@@ -577,7 +731,7 @@ export class MeshWebRTCManager {
     });
 
     for (const peer of activePeers) {
-      if (peer.controlChannel.readyState === 'open') {
+      if (peer.controlChannel && peer.controlChannel.readyState === 'open') {
         peer.controlChannel.send(headerPayload);
       }
     }
@@ -600,7 +754,14 @@ export class MeshWebRTCManager {
       }
 
       for (const peer of activePeers) {
-        const channel = peer.stripes[stripeIndex];
+        const availableStripes = peer.stripes.filter(
+          (s): s is RTCDataChannel => Boolean(s && s.readyState === 'open')
+        );
+        const channel =
+          availableStripes.length > 0
+            ? availableStripes[stripeIndex % availableStripes.length]
+            : peer.controlChannel;
+
         if (channel && channel.readyState === 'open') {
           channel.send(chunkBuffer);
         }
@@ -634,7 +795,7 @@ export class MeshWebRTCManager {
 
     const completionPayload = JSON.stringify({ type: 'file-complete', fileId });
     for (const peer of activePeers) {
-      if (peer.controlChannel.readyState === 'open') {
+      if (peer.controlChannel && peer.controlChannel.readyState === 'open') {
         peer.controlChannel.send(completionPayload);
       }
     }
@@ -643,7 +804,11 @@ export class MeshWebRTCManager {
   private async enforceBackpressure(peers: PeerNode[], stripeIdx: number): Promise<void> {
     const isOverloaded = () =>
       peers.some((peer) => {
-        const channel = peer.stripes[stripeIdx];
+        const availableStripes = peer.stripes.filter(
+          (s): s is RTCDataChannel => Boolean(s && s.readyState === 'open')
+        );
+        if (availableStripes.length === 0) return false;
+        const channel = availableStripes[stripeIdx % availableStripes.length];
         return channel && channel.bufferedAmount > this.MAX_BUFFER_THRESHOLD;
       });
 
@@ -651,7 +816,11 @@ export class MeshWebRTCManager {
 
     while (
       peers.some((peer) => {
-        const channel = peer.stripes[stripeIdx];
+        const availableStripes = peer.stripes.filter(
+          (s): s is RTCDataChannel => Boolean(s && s.readyState === 'open')
+        );
+        if (availableStripes.length === 0) return false;
+        const channel = availableStripes[stripeIdx % availableStripes.length];
         return channel && channel.bufferedAmount > this.LOW_WATERMARK;
       })
     ) {
@@ -663,13 +832,14 @@ export class MeshWebRTCManager {
     const peer = this.peers.get(peerId);
     if (peer) {
       try {
-        peer.controlChannel.close();
-        peer.stripes.forEach((stripe) => stripe.close());
+        peer.controlChannel?.close();
+        peer.stripes.forEach((stripe) => stripe?.close());
         peer.pc.close();
       } catch {
         // Ignored during teardown
       }
       this.peers.delete(peerId);
+      this.notifyDiagnosticsChanged();
     }
   }
 

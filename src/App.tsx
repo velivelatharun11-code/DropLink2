@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
-import { MeshWebRTCManager, type TransferProgress as ProgressData } from './core/webrtc';
+import { MeshWebRTCManager, type TransferProgress as ProgressData, type PeerDiagnosticInfo } from './core/webrtc';
 import { FilePreviewModal, type PreviewableFile } from './components/FilePreviewModal';
 import { QRCodeModal } from './components/QRCodeModal';
 import { ChatSidebar, type ChatMessage } from './components/ChatSidebar';
@@ -35,6 +35,7 @@ function MainApp() {
   const [gateError, setGateError] = useState<string | null>(null);
   const [roomError, setRoomError] = useState<string | null>(null);
   const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
+  const [peerDiagnostics, setPeerDiagnostics] = useState<PeerDiagnosticInfo[]>([]);
   const [occupancy, setOccupancy] = useState<number>(1);
   const [transferLock, setTransferLock] = useState<{
     isLocked: boolean;
@@ -112,6 +113,22 @@ function MainApp() {
 
     rtc.onPeersUpdated = (peerIds) => {
       setConnectedPeers(peerIds);
+    };
+
+    rtc.onPeerConnected = () => {
+      if (rtcManagerRef.current) {
+        setConnectedPeers(rtcManagerRef.current.getConnectedPeerIds());
+      }
+    };
+
+    rtc.onPeerDisconnected = () => {
+      if (rtcManagerRef.current) {
+        setConnectedPeers(rtcManagerRef.current.getConnectedPeerIds());
+      }
+    };
+
+    rtc.onPeerDiagnosticsUpdated = (diagnostics) => {
+      setPeerDiagnostics(diagnostics);
     };
 
     rtc.onRoomJoined = ({ roomId: joinedRoom, isProtected, occupancy: occ, transferLock: lock }) => {
@@ -295,6 +312,7 @@ function MainApp() {
     setRoomPassword('');
     setIsRoomProtected(false);
     setConnectedPeers([]);
+    setPeerDiagnostics([]);
     setOccupancy(1);
     setTransferLock(null);
     setSelectedFiles([]);
@@ -574,6 +592,64 @@ function MainApp() {
               </div>
             </section>
 
+            {/* Real-Time Mesh Diagnostics UI */}
+            {peerDiagnostics.length > 0 && (
+              <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-4 shadow-sm space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                    <span>⚡</span> P2P Mesh Diagnostics
+                  </h3>
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                    {connectedPeers.length}/{peerDiagnostics.length} Connected Peer(s)
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {peerDiagnostics.map((peer) => (
+                    <div
+                      key={peer.peerId}
+                      className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40 flex items-center justify-between gap-3 text-xs"
+                    >
+                      <div className="truncate min-w-0">
+                        <div className="font-semibold text-slate-800 dark:text-slate-200 truncate">
+                          {peer.peerName || `Peer #${peer.peerId.slice(0, 5)}`}
+                        </div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400 flex items-center gap-1.5 mt-0.5">
+                          {peer.status === 'connected' ? (
+                            <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400 font-medium">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                              Connected ({peer.openChannelsCount}/5 Channels Open)
+                            </span>
+                          ) : peer.status === 'failed' ? (
+                            <span className="inline-flex items-center gap-1 text-red-600 dark:text-red-400 font-medium">
+                              <span className="w-1.5 h-1.5 rounded-full bg-red-500" />
+                              Failed / NAT Blocked
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400 font-medium">
+                              <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                              Connecting (ICE checking)
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {peer.status === 'failed' && (
+                        <button
+                          type="button"
+                          onClick={() => rtcManagerRef.current?.retryPeer(peer.peerId)}
+                          className="px-2.5 py-1 rounded-lg bg-red-100 hover:bg-red-200 dark:bg-red-950/70 dark:hover:bg-red-900/60 text-red-700 dark:text-red-300 text-[11px] font-semibold transition cursor-pointer flex-shrink-0"
+                          title="Retry WebRTC & ICE connection"
+                        >
+                          Retry Connection
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
             {uploadProgress && (
               <TransferProgress progress={uploadProgress} direction={isTransferring ? "upload" : "download"} />
             )}
@@ -759,9 +835,9 @@ function MainApp() {
                     <button
                       type="button"
                       onClick={handleStartBroadcast}
-                      disabled={selectedFiles.length === 0 || isTransferring}
+                      disabled={selectedFiles.length === 0 || connectedPeers.length === 0 || isTransferring}
                       className={`ml-auto px-6 py-2.5 rounded-xl text-sm font-semibold shadow-md transition ${
-                        selectedFiles.length === 0 || isTransferring
+                        selectedFiles.length === 0 || connectedPeers.length === 0 || isTransferring
                           ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed shadow-none'
                           : 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer'
                       }`}
@@ -772,9 +848,11 @@ function MainApp() {
                           : 'Broadcasting...'
                         : selectedFiles.length === 0
                         ? 'Select Files to Broadcast'
+                        : connectedPeers.length === 0
+                        ? 'Connecting Channels (0 Active Peers)...'
                         : selectedFiles.length > 1
-                        ? `Broadcast ${selectedFiles.length} Files to ${occupancy - 1} Peer(s)`
-                        : `Broadcast to ${occupancy - 1} Peer(s)`}
+                        ? `Broadcast ${selectedFiles.length} Files to ${connectedPeers.length} Peer(s)`
+                        : `Broadcast to ${connectedPeers.length} Peer(s)`}
                     </button>
                   )}
                 </div>
