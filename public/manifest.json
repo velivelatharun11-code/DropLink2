@@ -1,10 +1,10 @@
-﻿{
-  "name": "DropLink2 P2P Streamer",
-  "short_name": "DropLink2",
-  "description": "Zero-RAM OPFS P2P Streamer with E2EE AES-GCM",
+{
+  "name": "DropLink2",
+  "short_name": "DropLink",
+  "description": "Zero-RAM 5-Peer WebRTC Mesh Streamer with OPFS & E2EE",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#09090b",
+  "background_color": "#0f172a",
   "theme_color": "#4f46e5",
   "icons": [
     {

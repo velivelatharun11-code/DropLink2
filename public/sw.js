@@ -1,8 +1,10 @@
-﻿const CACHE_NAME = 'droplink2-cache-v1';
+const CACHE_NAME = 'droplink2-shell-v2';
 const PRECACHE_ASSETS = [
   '/',
   '/index.html',
-  '/manifest.json'
+  '/manifest.json',
+  '/favicon.svg',
+  '/vite.svg'
 ];
 
 self.addEventListener('install', (event) => {
@@ -28,14 +30,25 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('fetch', (event) => {
-  // Do not intercept non-GET requests or socket.io polling/websocket requests
+  // Never intercept non-GET requests or socket.io signaling / WebRTC traffic
   if (event.request.method !== 'GET' || event.request.url.includes('/socket.io/')) {
     return;
   }
 
+  // Cache-first strategy for static shell assets with network fallback
   event.respondWith(
-    fetch(event.request)
-      .then((networkResponse) => {
+    caches.match(event.request).then((cachedResponse) => {
+      if (cachedResponse) {
+        // Update in background if online
+        fetch(event.request).then((networkResponse) => {
+          if (networkResponse && networkResponse.status === 200 && networkResponse.type === 'basic') {
+            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, networkResponse));
+          }
+        }).catch(() => {});
+        return cachedResponse;
+      }
+
+      return fetch(event.request).then((networkResponse) => {
         if (networkResponse && networkResponse.status === 200 && networkResponse.type === 'basic') {
           const responseToCache = networkResponse.clone();
           caches.open(CACHE_NAME).then((cache) => {
@@ -43,7 +56,11 @@ self.addEventListener('fetch', (event) => {
           });
         }
         return networkResponse;
-      })
-      .catch(() => caches.match(event.request))
+      }).catch(() => {
+        if (event.request.mode === 'navigate') {
+          return caches.match('/index.html');
+        }
+      });
+    })
   );
 });

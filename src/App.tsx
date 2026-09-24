@@ -1,9 +1,17 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { io, Socket } from 'socket.io-client';
+import { io, type Socket } from 'socket.io-client';
 import { MeshWebRTCManager, type TransferProgress as ProgressData } from './core/webrtc';
 import { FilePreviewModal, type PreviewableFile } from './components/FilePreviewModal';
+import { QRCodeModal } from './components/QRCodeModal';
+import { ChatSidebar, type ChatMessage } from './components/ChatSidebar';
 import { TransferProgress } from './components/TransferProgress';
 import { ThemeProvider, useTheme } from './context/ThemeContext';
+import { deriveRoomKey } from './core/crypto';
+
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+}
 
 function MainApp() {
   const { theme, toggleTheme } = useTheme();
@@ -11,6 +19,7 @@ function MainApp() {
   // Room & Peer State
   const [roomId, setRoomId] = useState<string>('');
   const [inputRoomId, setInputRoomId] = useState<string>('');
+  const [roomPassword, setRoomPassword] = useState<string>('');
   const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
   const [roomError, setRoomError] = useState<string | null>(null);
   const [isJoined, setIsJoined] = useState(false);
@@ -24,9 +33,19 @@ function MainApp() {
   const [uploadProgress, setUploadProgress] = useState<ProgressData | null>(null);
   const [receivedFiles, setReceivedFiles] = useState<Array<{ id: string; name: string; size: number }>>([]);
 
-  // Preview Modal State
+  // Preview & QR Modal State
   const [previewFile, setPreviewFile] = useState<PreviewableFile | null>(null);
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+  const [isQRModalOpen, setIsQRModalOpen] = useState(false);
+
+  // Chat State
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
+
+  // PWA Install State
+  const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null);
+  const [canInstall, setCanInstall] = useState(false);
 
   const socketRef = useRef<Socket | null>(null);
   const rtcManagerRef = useRef<MeshWebRTCManager | null>(null);
@@ -80,6 +99,16 @@ function MainApp() {
       setReceivedFiles((prev) => [fileMeta, ...prev]);
     };
 
+    rtc.onChatMessage = (msg) => {
+      setChatMessages((prev) => [...prev, { ...msg, isSelf: false }]);
+      setIsChatOpen((currentOpen) => {
+        if (!currentOpen) {
+          setUnreadChatCount((count) => count + 1);
+        }
+        return currentOpen;
+      });
+    };
+
     rtc.onError = (err) => {
       setRoomError(err);
     };
@@ -109,6 +138,51 @@ function MainApp() {
     window.addEventListener('hashchange', handleHashChange);
     return () => window.removeEventListener('hashchange', handleHashChange);
   }, [roomId]);
+
+  // Handle Room Password / E2EE Key derivation
+  useEffect(() => {
+    let isCancelled = false;
+    if (!roomPassword || !roomId) {
+      rtcManagerRef.current?.setEncryptionKey(null);
+      return;
+    }
+
+    deriveRoomKey(roomPassword, roomId)
+      .then((key) => {
+        if (!isCancelled) {
+          rtcManagerRef.current?.setEncryptionKey(key);
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to derive encryption key:', err);
+      });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [roomPassword, roomId]);
+
+  // Capture PWA beforeinstallprompt event
+  useEffect(() => {
+    const handleBeforeInstall = (e: Event) => {
+      e.preventDefault();
+      setDeferredPrompt(e as BeforeInstallPromptEvent);
+      setCanInstall(true);
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+    return () => window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+  }, []);
+
+  const handleInstallApp = async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    if (outcome === 'accepted') {
+      setCanInstall(false);
+    }
+    setDeferredPrompt(null);
+  };
 
   const handleJoinRoom = (targetId?: string) => {
     const roomToJoin = (targetId ?? inputRoomId).trim().replace(/^#/, '');
@@ -145,6 +219,12 @@ function MainApp() {
     } catch (err) {
       console.error('Failed to copy link:', err);
     }
+  };
+
+  const handleSendChatMessage = (text: string) => {
+    if (!rtcManagerRef.current) return;
+    const sentMsg = rtcManagerRef.current.sendChatMessage(text);
+    setChatMessages((prev) => [...prev, { ...sentMsg, isSelf: true }]);
   };
 
   const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -237,8 +317,39 @@ function MainApp() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
-          <div className="px-3 py-1 rounded-full text-xs font-semibold border flex items-center gap-1.5 border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/60">
+        <div className="flex items-center gap-2.5">
+          {/* PWA Install Button */}
+          {canInstall && (
+            <button
+              onClick={handleInstallApp}
+              className="px-3 py-1.5 rounded-xl border border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-950/50 hover:bg-indigo-100 dark:hover:bg-indigo-900 text-indigo-700 dark:text-indigo-300 text-xs font-semibold transition cursor-pointer flex items-center gap-1.5 shadow-sm"
+              title="Install DropLink2 Progressive Web App"
+            >
+              <span>⬇</span>
+              <span className="hidden sm:inline">Install App</span>
+            </button>
+          )}
+
+          {/* Chat Toggle Button */}
+          <button
+            onClick={() => {
+              setIsChatOpen((prev) => !prev);
+              setUnreadChatCount(0);
+            }}
+            className="relative px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer flex items-center gap-1.5 text-xs font-semibold"
+            aria-label="Toggle P2P Chat"
+          >
+            <span>💬</span>
+            <span className="hidden sm:inline">Chat</span>
+            {unreadChatCount > 0 && (
+              <span className="absolute -top-1 -right-1 px-1.5 py-0.5 text-[10px] font-bold bg-indigo-600 text-white rounded-full leading-none animate-pulse">
+                {unreadChatCount}
+              </span>
+            )}
+          </button>
+
+          {/* Peer Count Badge */}
+          <div className="px-3 py-1.5 rounded-full text-xs font-semibold border flex items-center gap-1.5 border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/60">
             <span
               className={`w-2 h-2 rounded-full ${
                 connectedPeers.length > 0 ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
@@ -247,6 +358,7 @@ function MainApp() {
             <span>{connectedPeers.length}/5 Peers</span>
           </div>
 
+          {/* Theme Toggle */}
           <button
             onClick={toggleTheme}
             className="p-2 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
@@ -286,13 +398,27 @@ function MainApp() {
                     Not Joined
                   </span>
                 )}
+                {roomPassword && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 rounded-full text-[11px] font-semibold">
+                    <span>🔒</span> E2EE
+                  </span>
+                )}
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                Share this link or URL hash with up to 4 other devices to mesh connect.
+                Share this link or QR code with up to 4 other devices to mesh connect.
               </p>
             </div>
 
             <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setIsQRModalOpen(true)}
+                className="px-3.5 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer flex items-center gap-1.5"
+                title="Show Room QR Code"
+              >
+                <span>📱</span> Show QR
+              </button>
+
               <button
                 type="button"
                 onClick={handleCopyLink}
@@ -313,8 +439,27 @@ function MainApp() {
             </div>
           </div>
 
+          {/* Room Password & E2EE Row */}
+          <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+            <div className="relative flex-1">
+              <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400 text-xs">🔒</span>
+              <input
+                type="password"
+                value={roomPassword}
+                onChange={(e) => setRoomPassword(e.target.value)}
+                placeholder="Optional Room Password (Enables AES-256-GCM E2EE)..."
+                className="w-full pl-8 pr-4 py-1.5 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition font-sans"
+              />
+            </div>
+            {roomPassword && (
+              <span className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 flex items-center gap-1 px-2 flex-shrink-0">
+                <span>✓</span> AES-256-GCM Active
+              </span>
+            )}
+          </div>
+
           {/* Interactive Room Input Bar */}
-          <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+          <div className="pt-2 flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
             <div className="relative flex-1">
               <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400 font-mono text-sm">#</span>
               <input
@@ -419,7 +564,7 @@ function MainApp() {
                     Click "Select Files", "Select Folder", or drop files/folders here
                   </span>
                   <span className="text-xs text-slate-400">
-                    Any format, zero-RAM chunked disk slice
+                    Any format, zero-RAM chunked disk slice {roomPassword ? '• AES-256-GCM E2EE Enabled' : ''}
                   </span>
                 </>
               ) : selectedFiles.length === 1 ? (
@@ -428,7 +573,7 @@ function MainApp() {
                     {selectedFiles[0].name}
                   </span>
                   <span className="text-xs text-slate-400">
-                    {(selectedFiles[0].size / (1024 * 1024)).toFixed(2)} MB
+                    {(selectedFiles[0].size / (1024 * 1024)).toFixed(2)} MB {roomPassword ? '• 🔒 Encrypted' : ''}
                   </span>
                 </>
               ) : (
@@ -437,7 +582,7 @@ function MainApp() {
                     {selectedFiles.length} files selected
                   </span>
                   <span className="text-xs text-slate-400">
-                    Total: {(selectedFiles.reduce((acc, f) => acc + f.size, 0) / (1024 * 1024)).toFixed(2)} MB
+                    Total: {(selectedFiles.reduce((acc, f) => acc + f.size, 0) / (1024 * 1024)).toFixed(2)} MB {roomPassword ? '• 🔒 Encrypted' : ''}
                   </span>
                 </>
               )}
@@ -548,10 +693,27 @@ function MainApp() {
         )}
       </main>
 
+      {/* File Preview Modal */}
       <FilePreviewModal
         file={previewFile}
         isOpen={isPreviewOpen}
         onClose={() => setIsPreviewOpen(false)}
+      />
+
+      {/* QR Code Sharing Modal */}
+      <QRCodeModal
+        roomId={roomId}
+        isOpen={isQRModalOpen}
+        onClose={() => setIsQRModalOpen(false)}
+      />
+
+      {/* P2P Chat & Clipboard Sync Sidebar */}
+      <ChatSidebar
+        isOpen={isChatOpen}
+        onClose={() => setIsChatOpen(false)}
+        messages={chatMessages}
+        onSendMessage={handleSendChatMessage}
+        connectedPeersCount={connectedPeers.length}
       />
     </div>
   );
