@@ -59,11 +59,20 @@ export class MeshWebRTCManager {
 
   public getConnectedPeerIds(): string[] {
     return Array.from(this.peers.entries())
-      .filter(([_, peer]) => peer.connected)
+      .filter(([, peer]) => peer.connected)
       .map(([id]) => id);
   }
 
+  public leaveRoom() {
+    Array.from(this.peers.keys()).forEach((peerId) => this.teardownPeer(peerId));
+    this.peers.clear();
+    this.notifyPeersChanged();
+  }
+
   public initRoom(roomId: string) {
+    if (this.roomId && this.roomId !== roomId) {
+      this.leaveRoom();
+    }
     this.roomId = roomId;
     this.socket.emit('join-room', roomId);
   }
@@ -380,7 +389,7 @@ export class MeshWebRTCManager {
         peer.controlChannel.close();
         peer.stripes.forEach((stripe) => stripe.close());
         peer.pc.close();
-      } catch (e) {
+      } catch {
         // Ignored during teardown
       }
       this.peers.delete(peerId);

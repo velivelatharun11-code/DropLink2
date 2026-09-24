@@ -35,7 +35,7 @@ app.get('/health', (req, res) => {
 });
 
 // Fallback all SPA routes to index.html
-app.get('*', (req, res) => {
+app.use((req, res) => {
   const indexPath = path.join(__dirname, 'dist', 'index.html');
   res.sendFile(indexPath, (err) => {
     if (err) {
@@ -49,6 +49,19 @@ io.on('connection', (socket) => {
 
   socket.on('join-room', (roomId) => {
     if (!roomId) return;
+
+    if (currentRoom && currentRoom !== roomId && rooms.has(currentRoom)) {
+      const oldRoom = rooms.get(currentRoom);
+      oldRoom.delete(socket.id);
+      socket.leave(currentRoom);
+      socket.to(currentRoom).emit('peer-left', {
+        peerId: socket.id,
+        totalPeers: oldRoom.size
+      });
+      if (oldRoom.size === 0) {
+        rooms.delete(currentRoom);
+      }
+    }
 
     if (!rooms.has(roomId)) {
       rooms.set(roomId, new Set());
