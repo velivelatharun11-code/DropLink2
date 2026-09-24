@@ -60,6 +60,8 @@ function MainApp() {
 
     const rtc = new MeshWebRTCManager(socket, workerRef.current || undefined);
     rtcManagerRef.current = rtc;
+    rtc.initRoom(currentRoom);
+    setIsJoined(true);
 
     rtc.onPeersUpdated = (peerIds) => {
       setConnectedPeers(peerIds);
@@ -336,7 +338,7 @@ function MainApp() {
                   : 'bg-indigo-600 hover:bg-indigo-700 text-white'
               }`}
             >
-              {isJoined && inputRoomId.trim().replace(/^#/, '') === roomId ? 'Re-Join' : 'Join'}
+              {isJoined && inputRoomId.trim().replace(/^#/, '') === roomId ? 'Re-Join' : 'Join Room'}
             </button>
           </div>
         </section>
