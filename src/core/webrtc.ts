@@ -46,6 +46,9 @@ export class MeshWebRTCManager {
   public onProgress?: (progress: TransferProgress) => void;
   public onFileReceived?: (fileMeta: { id: string; name: string; size: number }) => void;
   public onChatMessage?: (msg: { id: string; text: string; senderId: string; timestamp: number }) => void;
+  public onAuthRequired?: (data: { roomId: string; message: string }) => void;
+  public onAuthFailed?: (data: { roomId: string; message: string }) => void;
+  public onRoomJoined?: (data: { roomId: string; peerId: string; isProtected: boolean }) => void;
   public onError?: (error: string) => void;
 
   public setEncryptionKey(key: CryptoKey | null) {
@@ -90,17 +93,21 @@ export class MeshWebRTCManager {
   }
 
   public leaveRoom() {
+    if (this.roomId) {
+      this.socket.emit('leave-room');
+    }
     Array.from(this.peers.keys()).forEach((peerId) => this.teardownPeer(peerId));
     this.peers.clear();
+    this.roomId = '';
     this.notifyPeersChanged();
   }
 
-  public initRoom(roomId: string) {
+  public initRoom(roomId: string, password?: string) {
     if (this.roomId && this.roomId !== roomId) {
       this.leaveRoom();
     }
     this.roomId = roomId;
-    this.socket.emit('join-room', roomId);
+    this.socket.emit('join-room', { roomId, password });
   }
 
   private registerSignalingEvents() {
@@ -108,13 +115,33 @@ export class MeshWebRTCManager {
       this.myPeerId = this.socket.id || '';
     });
 
-    this.socket.on('room-joined', ({ peerId, existingPeers, isPolite }: { peerId: string; existingPeers: string[]; isPolite?: boolean }) => {
+    this.socket.on('room-auth-required', (data: { roomId: string; message: string }) => {
+      if (this.onAuthRequired) {
+        this.onAuthRequired(data);
+      } else if (this.onError) {
+        this.onError(data.message || 'Room password required.');
+      }
+    });
+
+    this.socket.on('room-auth-failed', (data: { roomId: string; message: string }) => {
+      if (this.onAuthFailed) {
+        this.onAuthFailed(data);
+      } else if (this.onError) {
+        this.onError(data.message || 'Invalid room password.');
+      }
+    });
+
+    this.socket.on('room-joined', ({ peerId, existingPeers, isPolite, isProtected }: { peerId: string; existingPeers: string[]; isPolite?: boolean; isProtected?: boolean }) => {
       this.myPeerId = peerId;
 
       existingPeers.forEach((remotePeerId) => {
         this.setupPeer(remotePeerId, isPolite ?? true);
       });
       this.notifyPeersChanged();
+
+      if (this.onRoomJoined) {
+        this.onRoomJoined({ roomId: this.roomId, peerId, isProtected: !!isProtected });
+      }
     });
 
     this.socket.on('peer-joined', ({ peerId }: { peerId: string }) => {
@@ -289,7 +316,8 @@ export class MeshWebRTCManager {
               type: 'INIT_FILE_STREAM',
               fileId: message.fileId,
               fileName: message.fileName,
-              fileSize: message.fileSize
+              fileSize: message.fileSize,
+              mimeType: message.mimeType || 'application/octet-stream'
             });
           }
           if (this.onFileReceived) {
@@ -355,6 +383,7 @@ export class MeshWebRTCManager {
       fileId,
       fileName: file.name,
       fileSize: file.size,
+      mimeType: file.type || 'application/octet-stream',
       isEncrypted: !!this.encryptionKey
     });
 

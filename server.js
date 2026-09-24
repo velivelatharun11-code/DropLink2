@@ -3,6 +3,7 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,8 +25,15 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3001;
 const MAX_PEERS_PER_ROOM = 5;
 
-// Room tracking: roomId -> Set of socket IDs
+// Room tracking: roomId -> { passwordHash: string | null, peers: Set<socketId> }
 const rooms = new Map();
+
+function hashPassword(password) {
+  if (!password || typeof password !== 'string') return null;
+  const trimmed = password.trim();
+  if (!trimmed) return null;
+  return crypto.createHash('sha256').update(trimmed).digest('hex');
+}
 
 // Serve static frontend build if dist folder exists
 app.use(express.static(path.join(__dirname, 'dist')));
@@ -47,30 +55,88 @@ app.use((req, res) => {
 io.on('connection', (socket) => {
   let currentRoom = null;
 
-  socket.on('join-room', (roomId) => {
+  // Query room status without joining
+  socket.on('check-room', (roomId, callback) => {
+    if (!roomId) return;
+    const cleanId = String(roomId).trim().replace(/^#/, '');
+    const exists = rooms.has(cleanId);
+    const roomData = exists ? rooms.get(cleanId) : null;
+    const isProtected = exists && !!roomData.passwordHash;
+    const peerCount = exists ? roomData.peers.size : 0;
+    const isFull = peerCount >= MAX_PEERS_PER_ROOM;
+
+    const info = {
+      roomId: cleanId,
+      exists,
+      isProtected,
+      peerCount,
+      isFull
+    };
+
+    if (typeof callback === 'function') {
+      callback(info);
+    } else {
+      socket.emit('room-info', info);
+    }
+  });
+
+  socket.on('join-room', (payload, maybePassword) => {
+    let roomId = typeof payload === 'object' && payload !== null ? payload.roomId : payload;
+    let password = typeof payload === 'object' && payload !== null ? payload.password : maybePassword;
+
+    if (!roomId) return;
+    roomId = String(roomId).trim().replace(/^#/, '');
     if (!roomId) return;
 
+    // Check if room exists
+    const roomExists = rooms.has(roomId);
+
+    if (!roomExists) {
+      // Create new room with optional password
+      const passwordHash = hashPassword(password);
+      rooms.set(roomId, {
+        passwordHash,
+        peers: new Set()
+      });
+    }
+
+    const roomData = rooms.get(roomId);
+
+    // If room is password-protected, authenticate
+    if (roomData.passwordHash) {
+      const incomingHash = hashPassword(password);
+      if (!incomingHash) {
+        socket.emit('room-auth-required', {
+          roomId,
+          message: 'This room is password-protected. Please enter the password to join.'
+        });
+        return;
+      }
+      if (incomingHash !== roomData.passwordHash) {
+        socket.emit('room-auth-failed', {
+          roomId,
+          message: 'Invalid room password. Access denied.'
+        });
+        return;
+      }
+    }
+
+    // Leave previous room cleanly if switching
     if (currentRoom && currentRoom !== roomId && rooms.has(currentRoom)) {
-      const oldRoom = rooms.get(currentRoom);
-      oldRoom.delete(socket.id);
+      const oldRoomData = rooms.get(currentRoom);
+      oldRoomData.peers.delete(socket.id);
       socket.leave(currentRoom);
       socket.to(currentRoom).emit('peer-left', {
         peerId: socket.id,
-        totalPeers: oldRoom.size
+        totalPeers: oldRoomData.peers.size
       });
-      if (oldRoom.size === 0) {
+      if (oldRoomData.peers.size === 0) {
         rooms.delete(currentRoom);
       }
     }
 
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, new Set());
-    }
-
-    const room = rooms.get(roomId);
-
     // Enforce 5-peer room cap
-    if (room.size >= MAX_PEERS_PER_ROOM && !room.has(socket.id)) {
+    if (roomData.peers.size >= MAX_PEERS_PER_ROOM && !roomData.peers.has(socket.id)) {
       socket.emit('room-full', { 
         roomId, 
         maxPeers: MAX_PEERS_PER_ROOM, 
@@ -82,27 +148,28 @@ io.on('connection', (socket) => {
     // Join room
     currentRoom = roomId;
     socket.join(roomId);
-    room.add(socket.id);
+    roomData.peers.add(socket.id);
 
     // Send existing peers list to the newly joined peer
     // In Perfect Negotiation: existing peers are impolite, the newly joined peer is polite
-    const existingPeers = Array.from(room).filter(id => id !== socket.id);
+    const existingPeers = Array.from(roomData.peers).filter(id => id !== socket.id);
     
     socket.emit('room-joined', {
       roomId,
       peerId: socket.id,
       existingPeers,
       isPolite: true,
-      maxPeers: MAX_PEERS_PER_ROOM
+      maxPeers: MAX_PEERS_PER_ROOM,
+      isProtected: !!roomData.passwordHash
     });
 
     // Notify other peers in room about the new participant
     socket.to(roomId).emit('peer-joined', {
       peerId: socket.id,
-      totalPeers: room.size
+      totalPeers: roomData.peers.size
     });
 
-    console.log(`[Socket] ${socket.id} joined room "${roomId}" (${room.size}/${MAX_PEERS_PER_ROOM} peers)`);
+    console.log(`[Socket] ${socket.id} joined room "${roomId}" (${roomData.peers.size}/${MAX_PEERS_PER_ROOM} peers) [protected: ${!!roomData.passwordHash}]`);
   });
 
   // Relay WebRTC signals (Offers, Answers, ICE Candidates)
@@ -115,25 +182,30 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Handle clean disconnections
-  socket.on('disconnect', () => {
+  // Handle clean disconnections and room exits
+  const handleLeave = () => {
     if (currentRoom && rooms.has(currentRoom)) {
-      const room = rooms.get(currentRoom);
-      room.delete(socket.id);
+      const roomData = rooms.get(currentRoom);
+      roomData.peers.delete(socket.id);
+      socket.leave(currentRoom);
 
       // Notify remaining peers
       socket.to(currentRoom).emit('peer-left', {
         peerId: socket.id,
-        totalPeers: room.size
+        totalPeers: roomData.peers.size
       });
 
-      console.log(`[Socket] ${socket.id} left room "${currentRoom}" (${room.size} remaining)`);
+      console.log(`[Socket] ${socket.id} left room "${currentRoom}" (${roomData.peers.size} remaining)`);
 
-      if (room.size === 0) {
+      if (roomData.peers.size === 0) {
         rooms.delete(currentRoom);
       }
+      currentRoom = null;
     }
-  });
+  };
+
+  socket.on('leave-room', handleLeave);
+  socket.on('disconnect', handleLeave);
 });
 
 server.listen(PORT, '0.0.0.0', () => {

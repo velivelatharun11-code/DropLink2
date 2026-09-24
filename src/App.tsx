@@ -4,6 +4,7 @@ import { MeshWebRTCManager, type TransferProgress as ProgressData } from './core
 import { FilePreviewModal, type PreviewableFile } from './components/FilePreviewModal';
 import { QRCodeModal } from './components/QRCodeModal';
 import { ChatSidebar, type ChatMessage } from './components/ChatSidebar';
+import { RoomGateModal } from './components/RoomGateModal';
 import { TransferProgress } from './components/TransferProgress';
 import { ThemeProvider, useTheme } from './context/ThemeContext';
 import { deriveRoomKey } from './core/crypto';
@@ -13,16 +14,27 @@ interface BeforeInstallPromptEvent extends Event {
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
 }
 
+export interface ReceivedFileItem {
+  id: string;
+  name: string;
+  sanitizedName?: string;
+  size: number;
+  mimeType?: string;
+}
+
 function MainApp() {
   const { theme, toggleTheme } = useTheme();
 
-  // Room & Peer State
-  const [roomId, setRoomId] = useState<string>('');
-  const [inputRoomId, setInputRoomId] = useState<string>('');
+  // Room & Gatekeeper State
+  const [roomId, setRoomId] = useState<string>(() => {
+    return window.location.hash.replace('#', '') || '';
+  });
   const [roomPassword, setRoomPassword] = useState<string>('');
-  const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
-  const [roomError, setRoomError] = useState<string | null>(null);
   const [isJoined, setIsJoined] = useState(false);
+  const [isRoomProtected, setIsRoomProtected] = useState(false);
+  const [gateError, setGateError] = useState<string | null>(null);
+  const [roomError, setRoomError] = useState<string | null>(null);
+  const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
   const [copied, setCopied] = useState(false);
 
   // File Transfer State
@@ -31,7 +43,7 @@ function MainApp() {
   const [isTransferring, setIsTransferring] = useState(false);
   const [currentBroadcastIndex, setCurrentBroadcastIndex] = useState(0);
   const [uploadProgress, setUploadProgress] = useState<ProgressData | null>(null);
-  const [receivedFiles, setReceivedFiles] = useState<Array<{ id: string; name: string; size: number }>>([]);
+  const [receivedFiles, setReceivedFiles] = useState<ReceivedFileItem[]>([]);
 
   // Preview & QR Modal State
   const [previewFile, setPreviewFile] = useState<PreviewableFile | null>(null);
@@ -54,23 +66,35 @@ function MainApp() {
   const folderInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    const hash = window.location.hash.replace('#', '');
-    const currentRoom = hash || Math.random().toString(36).substring(2, 8);
-    if (!hash) {
-      window.location.hash = currentRoom;
-    }
-    setRoomId(currentRoom);
-    setInputRoomId(currentRoom);
-
+    // Initialize OPFS Worker
     try {
-      workerRef.current = new Worker(
+      const worker = new Worker(
         new URL('./workers/opfs.worker.ts', import.meta.url),
         { type: 'module' }
       );
+
+      worker.onmessage = (e: MessageEvent) => {
+        const data = e.data || {};
+        if (data.type === 'TRANSFER_COMPLETE' || data.type === 'FILE_COMPLETE') {
+          const item: ReceivedFileItem = {
+            id: data.fileId || `file-${Date.now()}`,
+            name: data.originalName || data.fileName,
+            sanitizedName: data.fileName,
+            size: data.size || 0,
+            mimeType: data.mimeType || 'application/octet-stream',
+          };
+          setReceivedFiles((prev) => [item, ...prev.filter((f) => f.id !== item.id)]);
+        } else if (data.type === 'ERROR') {
+          console.error('[OPFS Worker Error]:', data.error);
+        }
+      };
+
+      workerRef.current = worker;
     } catch (e) {
       console.warn('OPFS Worker initialization fallback:', e);
     }
 
+    // Connect to Signaling Server
     const socket = io({
       transports: ['polling', 'websocket'],
       reconnectionAttempts: 5
@@ -79,11 +103,30 @@ function MainApp() {
 
     const rtc = new MeshWebRTCManager(socket, workerRef.current || undefined);
     rtcManagerRef.current = rtc;
-    rtc.initRoom(currentRoom);
-    setIsJoined(true);
 
     rtc.onPeersUpdated = (peerIds) => {
       setConnectedPeers(peerIds);
+    };
+
+    rtc.onRoomJoined = ({ roomId: joinedRoom, isProtected }) => {
+      setIsJoined(true);
+      setIsRoomProtected(isProtected);
+      setGateError(null);
+      setRoomError(null);
+      setRoomId(joinedRoom);
+      window.location.hash = joinedRoom;
+    };
+
+    rtc.onAuthRequired = (data) => {
+      setIsJoined(false);
+      setIsRoomProtected(true);
+      setGateError(data.message || 'Room is protected: password required.');
+    };
+
+    rtc.onAuthFailed = (data) => {
+      setIsJoined(false);
+      setIsRoomProtected(true);
+      setGateError(data.message || 'Incorrect room password. Access denied.');
     };
 
     rtc.onProgress = (prog) => {
@@ -93,10 +136,6 @@ function MainApp() {
           setUploadProgress((current) => (current?.percentage === 100 ? null : current));
         }, 1500);
       }
-    };
-
-    rtc.onFileReceived = (fileMeta) => {
-      setReceivedFiles((prev) => [fileMeta, ...prev]);
     };
 
     rtc.onChatMessage = (msg) => {
@@ -122,16 +161,16 @@ function MainApp() {
     };
   }, []);
 
-  // Listen for hash changes in URL (e.g. browser navigation or paste)
+  // Listen for hash changes in URL (e.g. user clicks a link or changes hash)
   useEffect(() => {
     const handleHashChange = () => {
       const hash = window.location.hash.replace('#', '');
       if (hash && hash !== roomId) {
-        setInputRoomId(hash);
         setRoomId(hash);
+        setIsJoined(false);
+        setGateError(null);
         if (rtcManagerRef.current) {
-          rtcManagerRef.current.initRoom(hash);
-          setIsJoined(true);
+          rtcManagerRef.current.leaveRoom();
         }
       }
     };
@@ -139,10 +178,10 @@ function MainApp() {
     return () => window.removeEventListener('hashchange', handleHashChange);
   }, [roomId]);
 
-  // Handle Room Password / E2EE Key derivation
+  // Handle Room Password / E2EE Key derivation when inside a room
   useEffect(() => {
     let isCancelled = false;
-    if (!roomPassword || !roomId) {
+    if (!roomPassword || !roomId || !isJoined) {
       rtcManagerRef.current?.setEncryptionKey(null);
       return;
     }
@@ -160,7 +199,7 @@ function MainApp() {
     return () => {
       isCancelled = true;
     };
-  }, [roomPassword, roomId]);
+  }, [roomPassword, roomId, isJoined]);
 
   // Capture PWA beforeinstallprompt event
   useEffect(() => {
@@ -184,34 +223,35 @@ function MainApp() {
     setDeferredPrompt(null);
   };
 
-  const handleJoinRoom = (targetId?: string) => {
-    const roomToJoin = (targetId ?? inputRoomId).trim().replace(/^#/, '');
-    if (!roomToJoin) return;
+  const handleJoinRoom = (targetRoomId: string, password?: string) => {
+    const cleanRoomId = targetRoomId.trim().replace(/^#/, '');
+    if (!cleanRoomId) return;
+
+    setGateError(null);
     setRoomError(null);
-    setRoomId(roomToJoin);
-    setInputRoomId(roomToJoin);
-    window.location.hash = roomToJoin;
+    setRoomId(cleanRoomId);
+    setRoomPassword(password || '');
+
     if (rtcManagerRef.current) {
-      rtcManagerRef.current.initRoom(roomToJoin);
-      setIsJoined(true);
+      rtcManagerRef.current.initRoom(cleanRoomId, password);
     }
   };
 
-  const handleNewRoom = () => {
-    const newRoom = Math.random().toString(36).substring(2, 8);
-    setRoomError(null);
-    setInputRoomId(newRoom);
-    setRoomId(newRoom);
-    window.location.hash = newRoom;
+  const handleLeaveRoom = () => {
     if (rtcManagerRef.current) {
-      rtcManagerRef.current.initRoom(newRoom);
-      setIsJoined(true);
+      rtcManagerRef.current.leaveRoom();
     }
+    setIsJoined(false);
+    setRoomId('');
+    setRoomPassword('');
+    setIsRoomProtected(false);
+    setConnectedPeers([]);
+    setGateError(null);
+    window.location.hash = '';
   };
 
   const handleCopyLink = async () => {
-    const activeRoom = roomId || inputRoomId.trim().replace(/^#/, '');
-    const url = `${window.location.origin}#${activeRoom}`;
+    const url = `${window.location.origin}#${roomId}`;
     try {
       await navigator.clipboard.writeText(url);
       setCopied(true);
@@ -259,41 +299,50 @@ function MainApp() {
     }
   };
 
-  const handleDownload = async (fileName: string) => {
+  const handleDownload = async (fileItem: ReceivedFileItem) => {
     try {
       const root = await navigator.storage.getDirectory();
-      const fileHandle = await root.getFileHandle(fileName);
-      const file = await fileHandle.getFile();
-      const url = URL.createObjectURL(file);
+      const sanitized = fileItem.sanitizedName || fileItem.name.replace(/[/\\]+/g, '__');
+      const handle = await root.getFileHandle(sanitized);
+      const file = await handle.getFile();
+      const blob = new Blob([await file.arrayBuffer()], {
+        type: fileItem.mimeType || file.type || 'application/octet-stream'
+      });
+      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = fileName;
+      a.download = fileItem.name;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
     } catch (err: any) {
-      console.error('Failed to download file from OPFS:', err);
-      setRoomError(err.message || `Failed to download "${fileName}"`);
+      console.error('Download error:', err);
+      setRoomError('Unable to retrieve file from local storage. Please try again.');
     }
   };
 
-  const handlePreviewReceivedFile = async (file: { id: string; name: string; size: number }) => {
+  const handlePreviewReceivedFile = async (fileItem: ReceivedFileItem) => {
     try {
       const root = await navigator.storage.getDirectory();
-      const fileHandle = await root.getFileHandle(file.name);
-      const fileBlob = await fileHandle.getFile();
+      const sanitized = fileItem.sanitizedName || fileItem.name.replace(/[/\\]+/g, '__');
+      const handle = await root.getFileHandle(sanitized);
+      const file = await handle.getFile();
+      const blob = new Blob([await file.arrayBuffer()], {
+        type: fileItem.mimeType || file.type || 'application/octet-stream'
+      });
       openPreview({
-        name: file.name,
-        size: file.size || fileBlob.size,
-        blob: fileBlob,
-        type: fileBlob.type,
+        name: fileItem.name,
+        size: fileItem.size || blob.size,
+        blob: blob,
+        type: blob.type,
       });
     } catch (err: any) {
-      console.warn('Failed to read file from OPFS for preview:', err);
+      console.warn('Failed to retrieve file from OPFS for preview:', err);
       openPreview({
-        name: file.name,
-        size: file.size,
+        name: fileItem.name,
+        size: fileItem.size,
+        type: fileItem.mimeType,
       });
     }
   };
@@ -330,33 +379,37 @@ function MainApp() {
             </button>
           )}
 
-          {/* Chat Toggle Button */}
-          <button
-            onClick={() => {
-              setIsChatOpen((prev) => !prev);
-              setUnreadChatCount(0);
-            }}
-            className="relative px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer flex items-center gap-1.5 text-xs font-semibold"
-            aria-label="Toggle P2P Chat"
-          >
-            <span>💬</span>
-            <span className="hidden sm:inline">Chat</span>
-            {unreadChatCount > 0 && (
-              <span className="absolute -top-1 -right-1 px-1.5 py-0.5 text-[10px] font-bold bg-indigo-600 text-white rounded-full leading-none animate-pulse">
-                {unreadChatCount}
-              </span>
-            )}
-          </button>
+          {/* Chat Toggle Button (Only active when in room) */}
+          {isJoined && (
+            <button
+              onClick={() => {
+                setIsChatOpen((prev) => !prev);
+                setUnreadChatCount(0);
+              }}
+              className="relative px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer flex items-center gap-1.5 text-xs font-semibold"
+              aria-label="Toggle P2P Chat"
+            >
+              <span>💬</span>
+              <span className="hidden sm:inline">Chat</span>
+              {unreadChatCount > 0 && (
+                <span className="absolute -top-1 -right-1 px-1.5 py-0.5 text-[10px] font-bold bg-indigo-600 text-white rounded-full leading-none animate-pulse">
+                  {unreadChatCount}
+                </span>
+              )}
+            </button>
+          )}
 
           {/* Peer Count Badge */}
-          <div className="px-3 py-1.5 rounded-full text-xs font-semibold border flex items-center gap-1.5 border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/60">
-            <span
-              className={`w-2 h-2 rounded-full ${
-                connectedPeers.length > 0 ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
-              }`}
-            />
-            <span>{connectedPeers.length}/5 Peers</span>
-          </div>
+          {isJoined && (
+            <div className="px-3 py-1.5 rounded-full text-xs font-semibold border flex items-center gap-1.5 border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/60">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  connectedPeers.length > 0 ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+                }`}
+              />
+              <span>{connectedPeers.length}/5 Peers</span>
+            </div>
+          )}
 
           {/* Theme Toggle */}
           <button
@@ -378,318 +431,279 @@ function MainApp() {
           </div>
         )}
 
-        {/* Room Control Bar */}
-        <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-4">
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-            <div>
-              <span className="text-xs uppercase font-bold tracking-wider text-slate-400">Mesh Room</span>
-              <div className="flex items-center gap-2 mt-0.5">
-                <span className="text-xl font-mono font-bold text-indigo-600 dark:text-indigo-400">
-                  #{roomId || '------'}
-                </span>
-                {isJoined ? (
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 rounded-full text-[11px] font-semibold">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                    Joined
-                  </span>
-                ) : (
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800 rounded-full text-[11px] font-semibold">
-                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
-                    Not Joined
-                  </span>
-                )}
-                {roomPassword && (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 rounded-full text-[11px] font-semibold">
-                    <span>🔒</span> E2EE
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                Share this link or QR code with up to 4 other devices to mesh connect.
-              </p>
-            </div>
-
-            <div className="flex items-center gap-2 flex-wrap">
-              <button
-                type="button"
-                onClick={() => setIsQRModalOpen(true)}
-                className="px-3.5 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer flex items-center gap-1.5"
-                title="Show Room QR Code"
-              >
-                <span>📱</span> Show QR
-              </button>
-
-              <button
-                type="button"
-                onClick={handleCopyLink}
-                className="px-3.5 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
-                title="Copy direct room link to clipboard"
-              >
-                {copied ? '✓ Copied Link' : 'Copy Link'}
-              </button>
-
-              <button
-                type="button"
-                onClick={handleNewRoom}
-                className="px-3.5 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
-                title="Generate fresh random room"
-              >
-                New Room
-              </button>
-            </div>
-          </div>
-
-          {/* Room Password & E2EE Row */}
-          <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-            <div className="relative flex-1">
-              <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400 text-xs">🔒</span>
-              <input
-                type="password"
-                value={roomPassword}
-                onChange={(e) => setRoomPassword(e.target.value)}
-                placeholder="Optional Room Password (Enables AES-256-GCM E2EE)..."
-                className="w-full pl-8 pr-4 py-1.5 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition font-sans"
-              />
-            </div>
-            {roomPassword && (
-              <span className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 flex items-center gap-1 px-2 flex-shrink-0">
-                <span>✓</span> AES-256-GCM Active
-              </span>
-            )}
-          </div>
-
-          {/* Interactive Room Input Bar */}
-          <div className="pt-2 flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-            <div className="relative flex-1">
-              <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400 font-mono text-sm">#</span>
-              <input
-                type="text"
-                value={inputRoomId}
-                onChange={(e) => setInputRoomId(e.target.value.trim())}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') handleJoinRoom();
-                }}
-                placeholder="Type or paste room ID (e.g. y3heon)"
-                className="w-full pl-8 pr-4 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-xl text-sm font-mono text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 transition"
-              />
-            </div>
-            <button
-              type="button"
-              onClick={() => handleJoinRoom()}
-              disabled={!inputRoomId.trim()}
-              className={`px-6 py-2 text-sm font-semibold rounded-xl shadow-sm transition cursor-pointer ${
-                !inputRoomId.trim()
-                  ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
-                  : 'bg-indigo-600 hover:bg-indigo-700 text-white'
-              }`}
-            >
-              {isJoined && inputRoomId.trim().replace(/^#/, '') === roomId ? 'Re-Join' : 'Join Room'}
-            </button>
-          </div>
-        </section>
-
-        {uploadProgress && (
-          <TransferProgress progress={uploadProgress} direction="upload" />
+        {/* 1. ROOM GATEKEEPER (Shown when user is not inside a room) */}
+        {!isJoined && (
+          <RoomGateModal
+            initialRoomId={roomId}
+            onJoinRoom={handleJoinRoom}
+            error={gateError}
+            onClearError={() => setGateError(null)}
+            isProtected={isRoomProtected}
+          />
         )}
 
-        {/* Dispatch File Section */}
-        <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">Dispatch Files to Mesh</h2>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={isTransferring}
-                className="px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
-              >
-                Select Files
-              </button>
-              <button
-                type="button"
-                onClick={() => folderInputRef.current?.click()}
-                disabled={isTransferring}
-                className="px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
-              >
-                Select Folder
-              </button>
-            </div>
-          </div>
-
-          {/* Hidden inputs */}
-          <input
-            ref={fileInputRef}
-            type="file"
-            id="file-input"
-            multiple
-            className="hidden"
-            onChange={handleFileInputChange}
-            disabled={isTransferring}
-          />
-          <input
-            ref={folderInputRef}
-            type="file"
-            id="folder-input"
-            className="hidden"
-            {...({ webkitdirectory: '', directory: '' } as any)}
-            onChange={handleFolderInputChange}
-            disabled={isTransferring}
-          />
-
-          {/* Dropzone */}
-          <div
-            onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
-            onDragLeave={() => setIsDragging(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setIsDragging(false);
-              if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                setSelectedFiles(Array.from(e.dataTransfer.files));
-              }
-            }}
-            className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors cursor-pointer ${
-              isDragging
-                ? 'border-indigo-500 bg-indigo-50/50 dark:bg-indigo-950/30'
-                : 'border-slate-300 dark:border-slate-700 hover:border-indigo-500'
-            }`}
-            onClick={() => {
-              if (selectedFiles.length === 0) fileInputRef.current?.click();
-            }}
-          >
-            <div className="flex flex-col items-center space-y-2">
-              <span className="text-3xl">📁</span>
-              {selectedFiles.length === 0 ? (
-                <>
-                  <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
-                    Click "Select Files", "Select Folder", or drop files/folders here
-                  </span>
-                  <span className="text-xs text-slate-400">
-                    Any format, zero-RAM chunked disk slice {roomPassword ? '• AES-256-GCM E2EE Enabled' : ''}
-                  </span>
-                </>
-              ) : selectedFiles.length === 1 ? (
-                <>
-                  <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
-                    {selectedFiles[0].name}
-                  </span>
-                  <span className="text-xs text-slate-400">
-                    {(selectedFiles[0].size / (1024 * 1024)).toFixed(2)} MB {roomPassword ? '• 🔒 Encrypted' : ''}
-                  </span>
-                </>
-              ) : (
-                <>
-                  <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
-                    {selectedFiles.length} files selected
-                  </span>
-                  <span className="text-xs text-slate-400">
-                    Total: {(selectedFiles.reduce((acc, f) => acc + f.size, 0) / (1024 * 1024)).toFixed(2)} MB {roomPassword ? '• 🔒 Encrypted' : ''}
-                  </span>
-                </>
-              )}
-            </div>
-          </div>
-
-          {/* Selected Files List (if > 1 file selected) */}
-          {selectedFiles.length > 1 && (
-            <div className="max-h-40 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800 rounded-xl border border-slate-200 dark:border-slate-800 p-2 text-xs">
-              {selectedFiles.map((file, idx) => (
-                <div key={idx} className="py-1.5 px-2 flex items-center justify-between">
-                  <div className="truncate flex-1 pr-2">
-                    <span className="font-medium text-slate-800 dark:text-slate-200">{file.name}</span>
-                    <span className="ml-2 text-slate-400">({(file.size / (1024 * 1024)).toFixed(2)} MB)</span>
+        {/* 2. ACTIVE MESH DASHBOARD (Shown only after user successfully enters room) */}
+        {isJoined && (
+          <>
+            {/* Room Info Bar */}
+            <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-4">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div>
+                  <span className="text-xs uppercase font-bold tracking-wider text-slate-400">Connected Room</span>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-xl font-mono font-bold text-indigo-600 dark:text-indigo-400">
+                      #{roomId}
+                    </span>
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 rounded-full text-[11px] font-semibold">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      Active Mesh
+                    </span>
+                    {roomPassword && (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 rounded-full text-[11px] font-semibold">
+                        <span>🔒</span> AES-256-GCM E2EE
+                      </span>
+                    )}
                   </div>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                    Share this link or QR code with up to 4 other devices to mesh connect.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 flex-wrap">
                   <button
                     type="button"
-                    onClick={() => openPreview({ name: file.name, size: file.size, blob: file, type: file.type })}
-                    className="text-[11px] font-semibold text-indigo-600 dark:text-indigo-400 hover:underline flex-shrink-0 cursor-pointer"
+                    onClick={() => setIsQRModalOpen(true)}
+                    className="px-3.5 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer flex items-center gap-1.5"
+                    title="Show Room QR Code"
                   >
-                    Preview
+                    <span>📱</span> Show QR
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleCopyLink}
+                    className="px-3.5 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
+                    title="Copy direct room link to clipboard"
+                  >
+                    {copied ? '✓ Copied Link' : 'Copy Link'}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleLeaveRoom}
+                    className="px-3.5 py-2 bg-red-50 dark:bg-red-950/40 hover:bg-red-100 dark:hover:bg-red-900/40 text-red-700 dark:text-red-300 text-xs font-semibold rounded-xl border border-red-200 dark:border-red-800 transition cursor-pointer"
+                    title="Leave active room"
+                  >
+                    Leave Room
                   </button>
                 </div>
-              ))}
-            </div>
-          )}
+              </div>
+            </section>
 
-          {/* Action Row */}
-          <div className="flex items-center justify-between pt-2">
-            <div className="flex items-center gap-3">
-              {selectedFiles.length === 1 && (
-                <button
-                  type="button"
-                  onClick={() => openPreview({
-                    name: selectedFiles[0].name,
-                    size: selectedFiles[0].size,
-                    blob: selectedFiles[0],
-                    type: selectedFiles[0].type
-                  })}
-                  className="text-xs font-semibold text-indigo-600 dark:text-indigo-400 hover:underline cursor-pointer"
-                >
-                  Preview Selected File
-                </button>
-              )}
-              {selectedFiles.length > 0 && !isTransferring && (
-                <button
-                  type="button"
-                  onClick={() => setSelectedFiles([])}
-                  className="text-xs font-semibold text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 cursor-pointer"
-                >
-                  Clear Selection
-                </button>
-              )}
-            </div>
+            {uploadProgress && (
+              <TransferProgress progress={uploadProgress} direction="upload" />
+            )}
 
-            <button
-              type="button"
-              onClick={handleStartBroadcast}
-              disabled={selectedFiles.length === 0 || connectedPeers.length === 0 || isTransferring}
-              className={`ml-auto px-6 py-2.5 rounded-xl text-sm font-semibold shadow-md transition ${
-                selectedFiles.length === 0 || connectedPeers.length === 0 || isTransferring
-                  ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
-                  : 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer'
-              }`}
-            >
-              {isTransferring
-                ? selectedFiles.length > 1
-                  ? `Broadcasting (${currentBroadcastIndex + 1}/${selectedFiles.length})...`
-                  : 'Broadcasting...'
-                : selectedFiles.length > 1
-                ? `Broadcast ${selectedFiles.length} Files to ${connectedPeers.length} Peer(s)`
-                : `Broadcast to ${connectedPeers.length} Peer(s)`}
-            </button>
-          </div>
-        </section>
-
-        {/* Received Files List */}
-        {receivedFiles.length > 0 && (
-          <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-3">
-            <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">Received Files (Direct to OPFS)</h2>
-            <div className="divide-y divide-slate-100 dark:divide-slate-800">
-              {receivedFiles.map((file) => (
-                <div key={file.id} className="py-3 flex items-center justify-between gap-4">
-                  <div className="truncate flex-1">
-                    <div className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{file.name}</div>
-                    <div className="text-xs text-slate-400">{(file.size / (1024 * 1024)).toFixed(2)} MB</div>
-                  </div>
-                  <div className="flex items-center gap-2 flex-shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => handlePreviewReceivedFile(file)}
-                      className="px-3 py-1.5 text-xs font-semibold bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg transition cursor-pointer"
-                    >
-                      Inspect / Preview
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDownload(file.name)}
-                      className="px-3 py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg shadow-sm transition cursor-pointer"
-                    >
-                      Download
-                    </button>
-                  </div>
+            {/* Dispatch File Section */}
+            <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">Dispatch Files to Mesh</h2>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isTransferring}
+                    className="px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
+                  >
+                    Select Files
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => folderInputRef.current?.click()}
+                    disabled={isTransferring}
+                    className="px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
+                  >
+                    Select Folder
+                  </button>
                 </div>
-              ))}
-            </div>
-          </section>
+              </div>
+
+              {/* Hidden inputs */}
+              <input
+                ref={fileInputRef}
+                type="file"
+                id="file-input"
+                multiple
+                className="hidden"
+                onChange={handleFileInputChange}
+                disabled={isTransferring}
+              />
+              <input
+                ref={folderInputRef}
+                type="file"
+                id="folder-input"
+                className="hidden"
+                {...({ webkitdirectory: '', directory: '' } as any)}
+                onChange={handleFolderInputChange}
+                disabled={isTransferring}
+              />
+
+              {/* Dropzone */}
+              <div
+                onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+                onDragLeave={() => setIsDragging(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setIsDragging(false);
+                  if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                    setSelectedFiles(Array.from(e.dataTransfer.files));
+                  }
+                }}
+                className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors cursor-pointer ${
+                  isDragging
+                    ? 'border-indigo-500 bg-indigo-50/50 dark:bg-indigo-950/30'
+                    : 'border-slate-300 dark:border-slate-700 hover:border-indigo-500'
+                }`}
+                onClick={() => {
+                  if (selectedFiles.length === 0) fileInputRef.current?.click();
+                }}
+              >
+                <div className="flex flex-col items-center space-y-2">
+                  <span className="text-3xl">📁</span>
+                  {selectedFiles.length === 0 ? (
+                    <>
+                      <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                        Click "Select Files", "Select Folder", or drop files/folders here
+                      </span>
+                      <span className="text-xs text-slate-400">
+                        Any format, zero-RAM chunked disk slice {roomPassword ? '• AES-256-GCM E2EE Enabled' : ''}
+                      </span>
+                    </>
+                  ) : selectedFiles.length === 1 ? (
+                    <>
+                      <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                        {selectedFiles[0].name}
+                      </span>
+                      <span className="text-xs text-slate-400">
+                        {(selectedFiles[0].size / (1024 * 1024)).toFixed(2)} MB {roomPassword ? '• 🔒 Encrypted' : ''}
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                        {selectedFiles.length} files selected
+                      </span>
+                      <span className="text-xs text-slate-400">
+                        Total: {(selectedFiles.reduce((acc, f) => acc + f.size, 0) / (1024 * 1024)).toFixed(2)} MB {roomPassword ? '• 🔒 Encrypted' : ''}
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {/* Selected Files List (if > 1 file selected) */}
+              {selectedFiles.length > 1 && (
+                <div className="max-h-40 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800 rounded-xl border border-slate-200 dark:border-slate-800 p-2 text-xs">
+                  {selectedFiles.map((file, idx) => (
+                    <div key={idx} className="py-1.5 px-2 flex items-center justify-between">
+                      <div className="truncate flex-1 pr-2">
+                        <span className="font-medium text-slate-800 dark:text-slate-200">{file.name}</span>
+                        <span className="ml-2 text-slate-400">({(file.size / (1024 * 1024)).toFixed(2)} MB)</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => openPreview({ name: file.name, size: file.size, blob: file, type: file.type })}
+                        className="text-[11px] font-semibold text-indigo-600 dark:text-indigo-400 hover:underline flex-shrink-0 cursor-pointer"
+                      >
+                        Preview
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Action Row */}
+              <div className="flex items-center justify-between pt-2">
+                <div className="flex items-center gap-3">
+                  {selectedFiles.length === 1 && (
+                    <button
+                      type="button"
+                      onClick={() => openPreview({
+                        name: selectedFiles[0].name,
+                        size: selectedFiles[0].size,
+                        blob: selectedFiles[0],
+                        type: selectedFiles[0].type
+                      })}
+                      className="text-xs font-semibold text-indigo-600 dark:text-indigo-400 hover:underline cursor-pointer"
+                    >
+                      Preview Selected File
+                    </button>
+                  )}
+                  {selectedFiles.length > 0 && !isTransferring && (
+                    <button
+                      type="button"
+                      onClick={() => setSelectedFiles([])}
+                      className="text-xs font-semibold text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 cursor-pointer"
+                    >
+                      Clear Selection
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleStartBroadcast}
+                  disabled={selectedFiles.length === 0 || connectedPeers.length === 0 || isTransferring}
+                  className={`ml-auto px-6 py-2.5 rounded-xl text-sm font-semibold shadow-md transition ${
+                    selectedFiles.length === 0 || connectedPeers.length === 0 || isTransferring
+                      ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
+                      : 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer'
+                  }`}
+                >
+                  {isTransferring
+                    ? selectedFiles.length > 1
+                      ? `Broadcasting (${currentBroadcastIndex + 1}/${selectedFiles.length})...`
+                      : 'Broadcasting...'
+                    : selectedFiles.length > 1
+                    ? `Broadcast ${selectedFiles.length} Files to ${connectedPeers.length} Peer(s)`
+                    : `Broadcast to ${connectedPeers.length} Peer(s)`}
+                </button>
+              </div>
+            </section>
+
+            {/* Received Files List */}
+            {receivedFiles.length > 0 && (
+              <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-3">
+                <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">Received Files (Direct to OPFS)</h2>
+                <div className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {receivedFiles.map((file) => (
+                    <div key={file.id} className="py-3 flex items-center justify-between gap-4">
+                      <div className="truncate flex-1">
+                        <div className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{file.name}</div>
+                        <div className="text-xs text-slate-400">{(file.size / (1024 * 1024)).toFixed(2)} MB</div>
+                      </div>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handlePreviewReceivedFile(file)}
+                          className="px-3 py-1.5 text-xs font-semibold bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg transition cursor-pointer"
+                        >
+                          Inspect / Preview
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDownload(file)}
+                          className="px-3 py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg shadow-sm transition cursor-pointer flex items-center gap-1"
+                        >
+                          <span>⬇</span> Download
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+          </>
         )}
       </main>
 
