@@ -1,480 +1,414 @@
-﻿import { getDefaultIceServers } from '../transport/ice';
-import { io, Socket } from 'socket.io-client';
-import { unpackChunk, DEFAULT_CHUNK_SIZE } from '../engine/framing';
-import { decryptChunk, deriveKey } from '../engine/crypto';
-import { StripeMultiplexer } from '../engine/stripeMultiplexer';
+import { Socket } from 'socket.io-client';
+import { rtcConfiguration } from '../transport/ice';
 
-export interface ExtendedFile {
-  file: File;
-  relativePath: string;
+export interface PeerNode {
+  id: string;
+  pc: RTCPeerConnection;
+  isPolite: boolean;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  isSettingRemoteAnswerPending: boolean;
+  controlChannel: RTCDataChannel;
+  stripes: RTCDataChannel[];
+  connected: boolean;
 }
 
-export interface TransferMetrics {
-  percent: number;
-  speedMBps: number;
-  bufferedAmountMB: number;
-  currentFileName: string;
-  bytesTransferred: number;
+export interface TransferProgress {
+  fileId: string;
+  fileName: string;
   totalBytes: number;
-  isPaused?: boolean;
+  transferredBytes: number;
+  speedBps: number;
+  percentage: number;
+  activeStripes: number[];
+  connectedPeersCount: number;
 }
 
-export interface PeerEvents {
-  onTransferAborted?: (reason?: string) => void;
-  onTransferPaused?: () => void;
-  onTransferResumed?: () => void;
-  onPeerConnected: (peerId: string) => void;
-  onPeerDisconnected: (peerId: string) => void;
-  onMetrics: (metrics: TransferMetrics) => void;
-  onFileReceived: (fileName: string, relativePath: string, file: Blob, checksum?: string) => void;
-  onStatusChange: (status: string) => void;
-}
-
-export class DropLinkEngine {
+export class MeshWebRTCManager {
   private socket: Socket;
-  private pc: RTCPeerConnection | null = null;
-  private dataChannels: RTCDataChannel[] = [];
-  private controlChannel: RTCDataChannel | null = null;
-  private worker: Worker;
-  private activeSenderWorker: Worker | null = null;
-  private events: PeerEvents;
-  private cryptoKey: CryptoKey | null = null;
-  private isCancelled: boolean = false;
-  private isTransferring: boolean = false;
-  private isPaused: boolean = false;
+  private myPeerId: string = '';
+  private roomId: string = '';
+  private peers: Map<string, PeerNode> = new Map();
+  private opfsWorker: Worker | null = null;
 
-  private startAckResolvers: Map<number, (resumedOffset: number) => void> = new Map();
-  private fileSavedResolvers: Map<number, () => void> = new Map();
+  // Flow control & Backpressure parameters
+  private readonly CHUNK_SIZE = 64 * 1024; // 64 KB slices
+  private readonly MAX_BUFFER_THRESHOLD = 16 * 1024 * 1024; // 16 MB max buffer
+  private readonly LOW_WATERMARK = 4 * 1024 * 1024; // 4 MB drain threshold
+  private readonly STRIPE_COUNT = 4;
 
-  constructor(serverUrl: string, events: PeerEvents, password?: string) {
-    this.events = events;
-    this.socket = io(serverUrl);
+  // Callbacks for UI updates
+  public onPeersUpdated?: (peerIds: string[]) => void;
+  public onProgress?: (progress: TransferProgress) => void;
+  public onFileReceived?: (fileMeta: { id: string; name: string; size: number }) => void;
+  public onError?: (error: string) => void;
 
-    if (password && password.trim().length > 0) {
-      const salt = new TextEncoder().encode('droplink2-static-salt-v1');
-      deriveKey(password.trim(), salt).then((key: CryptoKey) => {
-        this.cryptoKey = key;
-      });
-    }
-
-    this.worker = new Worker(
-      new URL('../workers/opfs.worker.ts', import.meta.url),
-      { type: 'module' }
-    );
-
-    this.setupWorker();
-    this.setupSocket();
+  constructor(socket: Socket, worker?: Worker) {
+    this.socket = socket;
+    this.opfsWorker = worker || null;
+    this.registerSignalingEvents();
   }
 
-  public pauseTransfer() {
-    if (!this.isTransferring || this.isPaused) return;
-    this.isPaused = true;
-    if (this.activeSenderWorker) {
-      this.activeSenderWorker.postMessage({ type: 'PAUSE' });
-    }
-    this.sendControlMessage({ type: 'TRANSFER_PAUSED' });
-    this.events.onTransferPaused?.();
-    this.events.onStatusChange('Transfer paused');
+  public setWorker(worker: Worker) {
+    this.opfsWorker = worker;
   }
 
-  public resumeTransfer() {
-    if (!this.isTransferring || !this.isPaused) return;
-    this.isPaused = false;
-    if (this.activeSenderWorker) {
-      this.activeSenderWorker.postMessage({ type: 'RESUME' });
-    }
-    this.sendControlMessage({ type: 'TRANSFER_RESUMED' });
-    this.events.onTransferResumed?.();
-    this.events.onStatusChange('Transfer resumed');
+  public getRoomId(): string {
+    return this.roomId;
   }
 
-  public cancelTransfer(reason: string = 'Transfer cancelled') {
-    this.isCancelled = true;
-    this.isPaused = false;
-    if (this.activeSenderWorker) {
-      this.activeSenderWorker.postMessage({ type: 'CANCEL' });
-      this.activeSenderWorker.terminate();
-      this.activeSenderWorker = null;
-    }
-    this.sendControlMessage({ type: 'TRANSFER_ABORT', reason });
-    this.worker.postMessage({ type: 'ABORT_FILE' });
-    this.startAckResolvers.clear();
-    this.fileSavedResolvers.clear();
-    this.events.onTransferAborted?.(reason);
-    this.events.onStatusChange(reason);
+  public getConnectedPeerIds(): string[] {
+    return Array.from(this.peers.entries())
+      .filter(([, peer]) => peer.connected)
+      .map(([id]) => id);
   }
 
-  public setPassword(password: string) {
-    if (password && password.trim().length > 0) {
-      const salt = new TextEncoder().encode('droplink2-static-salt-v1');
-      deriveKey(password.trim(), salt).then((key: CryptoKey) => {
-        this.cryptoKey = key;
-      });
-    } else {
-      this.cryptoKey = null;
-    }
+  public leaveRoom() {
+    Array.from(this.peers.keys()).forEach((peerId) => this.teardownPeer(peerId));
+    this.peers.clear();
+    this.notifyPeersChanged();
   }
 
-  private setupSocket() {
-    this.socket.on('peer-joined', async (peerId: string) => {
-      this.events.onStatusChange(`Peer found (${peerId}). Connecting...`);
-      await this.initPeerConnection(peerId, true);
+  public initRoom(roomId: string) {
+    if (this.roomId && this.roomId !== roomId) {
+      this.leaveRoom();
+    }
+    this.roomId = roomId;
+    this.socket.emit('join-room', roomId);
+  }
+
+  private registerSignalingEvents() {
+    this.socket.on('connect', () => {
+      this.myPeerId = this.socket.id || '';
     });
 
-    this.socket.on('signal', async ({ from, signal }: { from: string; signal: any }) => {
-      if (!this.pc) {
-        await this.initPeerConnection(from, false);
-      }
+    this.socket.on('room-joined', ({ peerId, existingPeers, isPolite }: { peerId: string; existingPeers: string[]; isPolite?: boolean }) => {
+      this.myPeerId = peerId;
 
-      if (signal.sdp) {
-        await this.pc!.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-        if (signal.sdp.type === 'offer') {
-          const answer = await this.pc!.createAnswer();
-          await this.pc!.setLocalDescription(answer);
-          this.socket.emit('signal', { to: from, signal: { sdp: this.pc!.localDescription } });
+      existingPeers.forEach((remotePeerId) => {
+        this.setupPeer(remotePeerId, isPolite ?? true);
+      });
+      this.notifyPeersChanged();
+    });
+
+    this.socket.on('peer-joined', ({ peerId }: { peerId: string }) => {
+      this.setupPeer(peerId, false);
+      this.notifyPeersChanged();
+    });
+
+    this.socket.on('signal', async ({ senderPeerId, signal }: { senderPeerId: string; signal: any }) => {
+      await this.handleIncomingSignal(senderPeerId, signal);
+    });
+
+    this.socket.on('peer-left', ({ peerId }: { peerId: string }) => {
+      this.teardownPeer(peerId);
+      this.notifyPeersChanged();
+    });
+
+    this.socket.on('room-full', ({ message }: { message: string }) => {
+      if (this.onError) {
+        this.onError(message || 'Room has reached its 5-peer capacity.');
+      }
+    });
+  }
+
+  private setupPeer(remotePeerId: string, isPolite: boolean): PeerNode {
+    if (this.peers.has(remotePeerId)) {
+      return this.peers.get(remotePeerId)!;
+    }
+
+    const pc = new RTCPeerConnection(rtcConfiguration);
+
+    const controlChannel = pc.createDataChannel('control', {
+      negotiated: true,
+      id: 0
+    });
+    controlChannel.binaryType = 'arraybuffer';
+
+    const stripes: RTCDataChannel[] = [];
+    for (let i = 0; i < this.STRIPE_COUNT; i++) {
+      const stripe = pc.createDataChannel(`stripe-${i}`, {
+        negotiated: true,
+        id: i + 1
+      });
+      stripe.binaryType = 'arraybuffer';
+      this.attachStripeListeners(stripe, i);
+      stripes.push(stripe);
+    }
+
+    const peerNode: PeerNode = {
+      id: remotePeerId,
+      pc,
+      isPolite,
+      makingOffer: false,
+      ignoreOffer: false,
+      isSettingRemoteAnswerPending: false,
+      controlChannel,
+      stripes,
+      connected: false
+    };
+
+    this.peers.set(remotePeerId, peerNode);
+
+    this.attachControlListeners(controlChannel);
+    this.attachPeerConnectionListeners(peerNode);
+
+    return peerNode;
+  }
+
+  private attachPeerConnectionListeners(peer: PeerNode) {
+    const { pc, id } = peer;
+
+    pc.onnegotiationneeded = async () => {
+      try {
+        peer.makingOffer = true;
+        await pc.setLocalDescription();
+        this.socket.emit('signal', {
+          targetPeerId: id,
+          signal: { description: pc.localDescription }
+        });
+      } catch (err) {
+        console.error(`[WebRTC] Negotiation error with peer ${id}:`, err);
+      } finally {
+        peer.makingOffer = false;
+      }
+    };
+
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) {
+        this.socket.emit('signal', {
+          targetPeerId: id,
+          signal: { candidate }
+        });
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      peer.connected = pc.connectionState === 'connected';
+      this.notifyPeersChanged();
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        this.teardownPeer(id);
+      }
+    };
+  }
+
+  private async handleIncomingSignal(senderId: string, signal: { description?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }) {
+    let peer = this.peers.get(senderId);
+    if (!peer) {
+      const isPolite = this.myPeerId > senderId;
+      peer = this.setupPeer(senderId, isPolite);
+    }
+
+    const { pc } = peer;
+
+    try {
+      if (signal.description) {
+        const description = signal.description;
+        const offerCollision =
+          description.type === 'offer' &&
+          (peer.makingOffer || pc.signalingState !== 'stable');
+
+        peer.ignoreOffer = !peer.isPolite && offerCollision;
+        if (peer.ignoreOffer) {
+          return;
+        }
+
+        peer.isSettingRemoteAnswerPending = description.type === 'answer';
+        await pc.setRemoteDescription(description);
+        peer.isSettingRemoteAnswerPending = false;
+
+        if (description.type === 'offer') {
+          await pc.setLocalDescription();
+          this.socket.emit('signal', {
+            targetPeerId: senderId,
+            signal: { description: pc.localDescription }
+          });
         }
       } else if (signal.candidate) {
         try {
-          await this.pc!.addIceCandidate(new RTCIceCandidate(signal.candidate));
+          await pc.addIceCandidate(signal.candidate);
         } catch (err) {
-          console.warn('ICE error:', err);
-        }
-      }
-    });
-
-    this.socket.on('peer-left', (peerId: string) => {
-      this.events.onPeerDisconnected(peerId);
-      this.events.onStatusChange('Peer disconnected');
-      this.cleanup();
-    });
-  }
-
-  private setupWorker() {
-    this.worker.onmessage = (e) => {
-      const { type, fileId, fileName, relativePath, file, bytesWritten, fileSize, checksum } = e.data;
-
-      if (type === 'FILE_INITIALIZED') {
-        const { resumedOffset } = e.data;
-        this.sendControlMessage({ type: 'START_ACK', fileId: Number(fileId), resumedOffset: resumedOffset || 0 });
-      } else if (type === 'WRITE_PROGRESS') {
-        const pct = fileSize > 0 ? (bytesWritten / fileSize) * 100 : 100;
-        this.events.onMetrics({
-          percent: Math.min(100, pct),
-          speedMBps: 0,
-          bufferedAmountMB: 0,
-          currentFileName: fileName,
-          bytesTransferred: bytesWritten,
-          totalBytes: fileSize,
-          isPaused: this.isPaused,
-        });
-      } else if (type === 'FILE_ABORTED') {
-        this.events.onStatusChange('OPFS partial storage purged');
-      } else if (type === 'FILE_COMPLETE') {
-        this.events.onMetrics({
-          percent: 100,
-          speedMBps: 0,
-          bufferedAmountMB: 0,
-          currentFileName: fileName,
-          bytesTransferred: fileSize || 0,
-          totalBytes: fileSize || 0,
-          isPaused: false,
-        });
-        this.events.onFileReceived(fileName, relativePath, file, checksum);
-        this.events.onStatusChange(`Saved to disk: ${fileName}`);
-        this.sendControlMessage({ type: 'FILE_SAVED', fileId: Number(fileId) });
-      }
-    };
-  }
-
-  private sendControlMessage(msg: any) {
-    if (this.controlChannel && this.controlChannel.readyState === 'open') {
-      this.controlChannel.send(JSON.stringify(msg));
-    }
-  }
-
-  public joinRoom(roomId: string) {
-    this.socket.emit('join-room', roomId);
-    this.events.onStatusChange(`Room ${roomId} joined. Waiting for peer...`);
-  }
-
-  private async initPeerConnection(remotePeerId: string, isInitiator: boolean) {
-    this.pc = new RTCPeerConnection({
-      iceServers: getDefaultIceServers(),
-      iceCandidatePoolSize: 10,
-      bundlePolicy: 'max-bundle',
-      rtcpMuxPolicy: 'require'
-    });
-
-    this.pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        this.socket.emit('signal', { to: remotePeerId, signal: { candidate: e.candidate } });
-      }
-    };
-
-    if (isInitiator) {
-      this.controlChannel = this.pc.createDataChannel('control', { ordered: true });
-      this.setupControlChannel(this.controlChannel);
-
-      this.dataChannels = [];
-      for (let i = 0; i < 4; i++) {
-        const dc = this.pc.createDataChannel(`stripe_${i}`, { ordered: true });
-        dc.binaryType = 'arraybuffer';
-        dc.bufferedAmountLowThreshold = 256 * 1024;
-        this.dataChannels.push(dc);
-      }
-
-      const offer = await this.pc.createOffer();
-      await this.pc.setLocalDescription(offer);
-      this.socket.emit('signal', { to: remotePeerId, signal: { sdp: this.pc.localDescription } });
-    } else {
-      this.pc.ondatachannel = (e) => {
-        const dc = e.channel;
-        if (dc.label === 'control') {
-          this.controlChannel = dc;
-          this.setupControlChannel(dc);
-        } else {
-          dc.binaryType = 'arraybuffer';
-          dc.onmessage = (msgEvent) => this.handleIncomingChunk(msgEvent.data);
-          this.dataChannels.push(dc);
-        }
-      };
-    }
-
-    this.pc.onconnectionstatechange = () => {
-      const state = this.pc?.connectionState;
-      if (state === 'connected') {
-        this.events.onPeerConnected(remotePeerId);
-        this.events.onStatusChange('P2P Direct Mesh Active');
-      } else if (this.isTransferring && (state === 'disconnected' || state === 'failed' || state === 'closed')) {
-        this.cancelTransfer('Peer connection lost');
-      }
-    };
-  }
-
-  private setupControlChannel(dc: RTCDataChannel) {
-    dc.onopen = () => {
-      this.events.onStatusChange('Control channel connected');
-    };
-
-    dc.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-
-      if (msg.type === 'TRANSFER_ABORT') {
-        this.isCancelled = true;
-        this.isPaused = false;
-        this.worker.postMessage({ type: 'ABORT_FILE' });
-        this.startAckResolvers.clear();
-        this.fileSavedResolvers.clear();
-        const reason = msg.reason || 'Transfer cancelled by peer';
-        this.events.onTransferAborted?.(reason);
-        this.events.onStatusChange(reason);
-        return;
-      } else if (msg.type === 'TRANSFER_PAUSED') {
-        this.isPaused = true;
-        this.events.onTransferPaused?.();
-        this.events.onStatusChange('Transfer paused by peer');
-      } else if (msg.type === 'TRANSFER_RESUMED') {
-        this.isPaused = false;
-        this.events.onTransferResumed?.();
-        this.events.onStatusChange('Transfer resumed by peer');
-      } else if (msg.type === 'START_FILE') {
-        this.events.onStatusChange(`Preparing disk for: ${msg.fileName}`);
-        this.worker.postMessage({
-          type: 'INIT_FILE',
-          payload: {
-            fileId: String(msg.fileId),
-            fileName: msg.fileName,
-            relativePath: msg.relativePath,
-            fileSize: msg.fileSize,
-          },
-        });
-      } else if (msg.type === 'START_ACK') {
-        const resolve = this.startAckResolvers.get(Number(msg.fileId));
-        if (resolve) {
-          resolve(Number(msg.resumedOffset || 0));
-          this.startAckResolvers.delete(Number(msg.fileId));
-        }
-      } else if (msg.type === 'END_FILE') {
-        this.worker.postMessage({
-          type: 'FINALIZE_FILE',
-          payload: { fileId: String(msg.fileId) },
-        });
-      } else if (msg.type === 'FILE_SAVED') {
-        const resolve = this.fileSavedResolvers.get(Number(msg.fileId));
-        if (resolve) {
-          resolve();
-          this.fileSavedResolvers.delete(Number(msg.fileId));
-        }
-      }
-    };
-  }
-
-  private async handleIncomingChunk(buffer: ArrayBuffer) {
-    const { fileId, byteOffset, payload } = unpackChunk(new Uint8Array(buffer));
-    let finalPayload = payload;
-
-    if (this.cryptoKey) {
-      try {
-        finalPayload = await decryptChunk(payload, this.cryptoKey);
-      } catch {
-        this.events.onStatusChange('Decryption error: Password mismatch!');
-        return;
-      }
-    }
-
-    this.worker.postMessage(
-      {
-        type: 'WRITE_CHUNK',
-        payload: { fileId: String(fileId), offset: byteOffset, buffer: finalPayload },
-      },
-      [finalPayload.buffer]
-    );
-  }
-
-  public async sendBatch(items: ExtendedFile[]) {
-    if (!this.controlChannel || this.dataChannels.length === 0) return;
-    this.isCancelled = false;
-    this.isPaused = false;
-    this.isTransferring = true;
-
-    const multiplexer = new StripeMultiplexer(this.dataChannels);
-
-    for (let i = 0; i < items.length; i++) {
-      if (this.isCancelled) break;
-      const { file, relativePath } = items[i];
-      const fileId = i + 1;
-
-      let safeResumeOffset = 0;
-      const startAckPromise = new Promise<number>((resolve) => {
-        this.startAckResolvers.set(fileId, resolve);
-      });
-      const fileSavedPromise = new Promise<void>((resolve) => {
-        this.fileSavedResolvers.set(fileId, resolve);
-      });
-
-      this.events.onStatusChange(`[File ${i + 1}/${items.length}] Handshake: ${file.name}`);
-
-      this.controlChannel.send(
-        JSON.stringify({
-          type: 'START_FILE',
-          fileId,
-          fileName: file.name,
-          relativePath,
-          fileSize: file.size,
-        })
-      );
-
-      safeResumeOffset = await Promise.race([
-        startAckPromise,
-        new Promise<number>((resolve) => setTimeout(() => resolve(0), 10000)),
-      ]);
-
-      if (safeResumeOffset > 0) {
-        this.events.onStatusChange(`[File ${i + 1}/${items.length}] Resuming ${file.name} from ${(safeResumeOffset / 1024 / 1024).toFixed(1)} MB`);
-      } else {
-        this.events.onStatusChange(`[File ${i + 1}/${items.length}] Streaming: ${file.name}`);
-      }
-
-      const startTime = performance.now();
-      await new Promise<void>((resolve, reject) => {
-        this.activeSenderWorker = new Worker(
-          new URL('../workers/transferSender.worker.js', import.meta.url),
-          { type: 'module' }
-        );
-
-        this.activeSenderWorker.onmessage = async (e) => {
-          const { type, data } = e.data;
-
-          if (type === 'CHUNK_PACKET') {
-            const { packet, byteOffset, totalSize } = data;
-            try {
-              if (this.isCancelled) {
-                this.activeSenderWorker?.postMessage({ type: 'CANCEL' });
-                this.activeSenderWorker?.terminate();
-                this.activeSenderWorker = null;
-                resolve();
-                return;
-              }
-
-              await multiplexer.sendPacket(new Uint8Array(packet));
-
-              const elapsedSec = (performance.now() - startTime) / 1000;
-              const speed = elapsedSec > 0 && !this.isPaused ? byteOffset / (1024 * 1024) / elapsedSec : 0;
-              const currentBufferMB = this.dataChannels.reduce((sum, ch) => sum + ch.bufferedAmount, 0) / (1024 * 1024);
-
-              this.events.onMetrics({
-                percent: Math.min(100, (byteOffset / totalSize) * 100),
-                speedMBps: speed,
-                bufferedAmountMB: currentBufferMB,
-                currentFileName: file.name,
-                bytesTransferred: byteOffset,
-                totalBytes: totalSize,
-                isPaused: this.isPaused,
-              });
-            } catch (err) {
-              this.activeSenderWorker?.terminate();
-              this.activeSenderWorker = null;
-              reject(err);
-            }
-          } else if (type === 'TRANSFER_COMPLETE') {
-            this.activeSenderWorker?.terminate();
-            this.activeSenderWorker = null;
-            resolve();
-          } else if (type === 'ERROR') {
-            this.activeSenderWorker?.terminate();
-            this.activeSenderWorker = null;
-            reject(new Error(data.message));
+          if (!peer.ignoreOffer) {
+            console.error(`[WebRTC] Candidate error for peer ${senderId}:`, err);
           }
-        };
-
-        this.activeSenderWorker.postMessage({
-          type: 'START_TRANSFER',
-          data: {
-            file,
-            fileId,
-            key: this.cryptoKey,
-            startOffset: safeResumeOffset,
-            chunkSize: DEFAULT_CHUNK_SIZE,
-          },
-        });
-      });
-
-      await multiplexer.flush();
-
-      this.events.onMetrics({
-        percent: 100,
-        speedMBps: 0,
-        bufferedAmountMB: 0,
-        currentFileName: file.name,
-        bytesTransferred: file.size,
-        totalBytes: file.size,
-        isPaused: false,
-      });
-
-      this.controlChannel.send(JSON.stringify({ type: 'END_FILE', fileId }));
-      this.events.onStatusChange(`[File ${i + 1}/${items.length}] Waiting for receiver disk flush: ${file.name}...`);
-
-      await Promise.race([
-        fileSavedPromise,
-        new Promise((resolve) => setTimeout(resolve, 60000)),
-      ]);
-
-      this.events.onStatusChange(`[File ${i + 1}/${items.length}] Confirmed & Verified: ${file.name}`);
+        }
+      }
+    } catch (err) {
+      console.error(`[WebRTC] Signal handling failed from ${senderId}:`, err);
     }
-
-    this.isTransferring = false;
-    this.isPaused = false;
-    this.events.onStatusChange('All files transferred and verified!');
   }
 
-  private cleanup() {
-    this.pc?.close();
-    this.pc = null;
-    this.dataChannels = [];
-    this.controlChannel = null;
-    this.activeSenderWorker?.terminate();
-    this.activeSenderWorker = null;
-    this.startAckResolvers.clear();
-    this.fileSavedResolvers.clear();
+  private attachControlListeners(channel: RTCDataChannel) {
+    channel.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'file-header') {
+          if (this.opfsWorker) {
+            this.opfsWorker.postMessage({
+              type: 'INIT_FILE_STREAM',
+              fileId: message.fileId,
+              fileName: message.fileName,
+              fileSize: message.fileSize
+            });
+          }
+          if (this.onFileReceived) {
+            this.onFileReceived({
+              id: message.fileId,
+              name: message.fileName,
+              size: message.fileSize
+            });
+          }
+        } else if (message.type === 'file-complete') {
+          if (this.opfsWorker) {
+            this.opfsWorker.postMessage({
+              type: 'CLOSE_FILE_STREAM',
+              fileId: message.fileId
+            });
+          }
+        }
+      } catch (e) {
+        console.error(`[Control] Error reading control payload:`, e);
+      }
+    };
+  }
+
+  private attachStripeListeners(channel: RTCDataChannel, stripeIndex: number) {
+    channel.onmessage = (event) => {
+      const buffer = event.data as ArrayBuffer;
+
+      if (this.opfsWorker) {
+        this.opfsWorker.postMessage(
+          {
+            type: 'WRITE_CHUNK',
+            stripeIndex,
+            chunk: buffer
+          },
+          [buffer]
+        );
+      }
+    };
+  }
+
+  public async streamFileToAllPeers(file: File): Promise<void> {
+    const activePeers = Array.from(this.peers.values()).filter((p) => p.connected);
+    if (activePeers.length === 0) {
+      throw new Error('No connected peers in room to stream file.');
+    }
+
+    const fileId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+    const headerPayload = JSON.stringify({
+      type: 'file-header',
+      fileId,
+      fileName: file.name,
+      fileSize: file.size
+    });
+
+    for (const peer of activePeers) {
+      if (peer.controlChannel.readyState === 'open') {
+        peer.controlChannel.send(headerPayload);
+      }
+    }
+
+    let offset = 0;
+    let stripeIndex = 0;
+    let transferredBytes = 0;
+    const startTime = performance.now();
+    let lastProgressUpdate = performance.now();
+
+    while (offset < file.size) {
+      await this.enforceBackpressure(activePeers, stripeIndex);
+
+      const sliceEnd = Math.min(offset + this.CHUNK_SIZE, file.size);
+      const blobSlice = file.slice(offset, sliceEnd);
+      const chunkBuffer = await blobSlice.arrayBuffer();
+
+      for (const peer of activePeers) {
+        const channel = peer.stripes[stripeIndex];
+        if (channel && channel.readyState === 'open') {
+          channel.send(chunkBuffer);
+        }
+      }
+
+      transferredBytes += chunkBuffer.byteLength;
+      offset = sliceEnd;
+      stripeIndex = (stripeIndex + 1) % this.STRIPE_COUNT;
+
+      const now = performance.now();
+      if (now - lastProgressUpdate > 16 || offset >= file.size) {
+        const elapsedSec = (now - startTime) / 1000;
+        const speedBps = elapsedSec > 0 ? transferredBytes / elapsedSec : 0;
+        const percentage = Math.round((transferredBytes / file.size) * 100);
+
+        if (this.onProgress) {
+          this.onProgress({
+            fileId,
+            fileName: file.name,
+            totalBytes: file.size,
+            transferredBytes,
+            speedBps,
+            percentage,
+            activeStripes: [stripeIndex],
+            connectedPeersCount: activePeers.length
+          });
+        }
+        lastProgressUpdate = now;
+      }
+    }
+
+    const completionPayload = JSON.stringify({ type: 'file-complete', fileId });
+    for (const peer of activePeers) {
+      if (peer.controlChannel.readyState === 'open') {
+        peer.controlChannel.send(completionPayload);
+      }
+    }
+  }
+
+  private async enforceBackpressure(peers: PeerNode[], stripeIdx: number): Promise<void> {
+    const isOverloaded = () =>
+      peers.some((peer) => {
+        const channel = peer.stripes[stripeIdx];
+        return channel && channel.bufferedAmount > this.MAX_BUFFER_THRESHOLD;
+      });
+
+    if (!isOverloaded()) return;
+
+    while (
+      peers.some((peer) => {
+        const channel = peer.stripes[stripeIdx];
+        return channel && channel.bufferedAmount > this.LOW_WATERMARK;
+      })
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  private teardownPeer(peerId: string) {
+    const peer = this.peers.get(peerId);
+    if (peer) {
+      try {
+        peer.controlChannel.close();
+        peer.stripes.forEach((stripe) => stripe.close());
+        peer.pc.close();
+      } catch {
+        // Ignored during teardown
+      }
+      this.peers.delete(peerId);
+    }
+  }
+
+  private notifyPeersChanged() {
+    if (this.onPeersUpdated) {
+      this.onPeersUpdated(this.getConnectedPeerIds());
+    }
+  }
+
+  public destroy() {
+    Array.from(this.peers.keys()).forEach((peerId) => this.teardownPeer(peerId));
+    this.peers.clear();
+    this.socket.off('room-joined');
+    this.socket.off('peer-joined');
+    this.socket.off('signal');
+    this.socket.off('peer-left');
+    this.socket.off('room-full');
   }
 }

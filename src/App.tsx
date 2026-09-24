@@ -1,612 +1,566 @@
-﻿import { useState, useEffect, useRef, type ChangeEvent } from 'react';
-import QRCode from 'qrcode';
-import { DropLinkEngine, type ExtendedFile, type TransferMetrics } from './core/webrtc';
-import { downloadAllAsZip } from './core/zip';
-import {
-  listOPFSFiles,
-  getStorageQuota,
-  getOPFSFileBlob,
-  purgeOPFSEntry,
-  purgeAllOPFS,
-  type StoredOPFSFile,
-  type StorageQuotaInfo
-} from './storage/cleaner';
-import { 
-  HardDrive, Send, Download, Wifi, CheckCircle2, ShieldCheck, 
-  Copy, Check, FolderUp, Files, Activity, Gauge, Database, Archive, Lock, Trash2, RefreshCw, XCircle, Folder,
-  Pause, Play, QrCode
-} from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { io, Socket } from 'socket.io-client';
+import { MeshWebRTCManager, type TransferProgress as ProgressData } from './core/webrtc';
+import { FilePreviewModal, type PreviewableFile } from './components/FilePreviewModal';
+import { TransferProgress } from './components/TransferProgress';
+import { ThemeProvider, useTheme } from './context/ThemeContext';
 
-export default function App() {
-  const [roomId, setRoomId] = useState('');
-  const [password, setPassword] = useState('');
-  const [joined, setJoined] = useState(false);
-  const [qrSrc, setQrSrc] = useState('');
-  const [showQrModal, setShowQrModal] = useState(false);
-  const [status, setStatus] = useState('Idle');
-  const [connectedPeer, setConnectedPeer] = useState<string | null>(null);
-  const [metrics, setMetrics] = useState<TransferMetrics | null>(null);
-  const [isPaused, setIsPaused] = useState(false);
-  const [receivedFiles, setReceivedFiles] = useState<{ 
-    name: string; 
-    path: string; 
-    url: string; 
-    blob: Blob;
-    checksum?: string;
-  }[]>([]);
-  const [selectedItems, setSelectedItems] = useState<ExtendedFile[]>([]);
+function MainApp() {
+  const { theme, toggleTheme } = useTheme();
+
+  // Room & Peer State
+  const [roomId, setRoomId] = useState<string>('');
+  const [inputRoomId, setInputRoomId] = useState<string>('');
+  const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
+  const [roomError, setRoomError] = useState<string | null>(null);
+  const [isJoined, setIsJoined] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [showStorageModal, setShowStorageModal] = useState(false);
-  const [opfsFiles, setOpfsFiles] = useState<StoredOPFSFile[]>([]);
-  const [quotaInfo, setQuotaInfo] = useState<StorageQuotaInfo | null>(null);
-  const [isTransferring, setIsTransferring] = useState(false);
 
-  const engineRef = useRef<DropLinkEngine | null>(null);
+  // File Transfer State
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isTransferring, setIsTransferring] = useState(false);
+  const [currentBroadcastIndex, setCurrentBroadcastIndex] = useState(0);
+  const [uploadProgress, setUploadProgress] = useState<ProgressData | null>(null);
+  const [receivedFiles, setReceivedFiles] = useState<Array<{ id: string; name: string; size: number }>>([]);
+
+  // Preview Modal State
+  const [previewFile, setPreviewFile] = useState<PreviewableFile | null>(null);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+
+  const socketRef = useRef<Socket | null>(null);
+  const rtcManagerRef = useRef<MeshWebRTCManager | null>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    const initialRoom = window.location.hash.replace('#', '') || Math.random().toString(36).substring(2,8);
-    setRoomId(initialRoom);
+    const hash = window.location.hash.replace('#', '');
+    const currentRoom = hash || Math.random().toString(36).substring(2, 8);
+    if (!hash) {
+      window.location.hash = currentRoom;
+    }
+    setRoomId(currentRoom);
+    setInputRoomId(currentRoom);
+
+    try {
+      workerRef.current = new Worker(
+        new URL('./workers/opfs.worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+    } catch (e) {
+      console.warn('OPFS Worker initialization fallback:', e);
+    }
+
+    const socket = io({
+      transports: ['polling', 'websocket'],
+      reconnectionAttempts: 5
+    });
+    socketRef.current = socket;
+
+    const rtc = new MeshWebRTCManager(socket, workerRef.current || undefined);
+    rtcManagerRef.current = rtc;
+    rtc.initRoom(currentRoom);
+    setIsJoined(true);
+
+    rtc.onPeersUpdated = (peerIds) => {
+      setConnectedPeers(peerIds);
+    };
+
+    rtc.onProgress = (prog) => {
+      setUploadProgress(prog);
+      if (prog.percentage >= 100) {
+        setTimeout(() => {
+          setUploadProgress((current) => (current?.percentage === 100 ? null : current));
+        }, 1500);
+      }
+    };
+
+    rtc.onFileReceived = (fileMeta) => {
+      setReceivedFiles((prev) => [fileMeta, ...prev]);
+    };
+
+    rtc.onError = (err) => {
+      setRoomError(err);
+    };
+
+    return () => {
+      rtc.destroy();
+      socket.disconnect();
+      if (workerRef.current) {
+        workerRef.current.terminate();
+      }
+    };
   }, []);
 
-  const handleJoin = async () => {
-    if (!roomId) return;
-    window.location.hash = roomId;
-
-    const currentUrl = `${window.location.origin}/#${roomId}`;
-    try {
-      const qr = await QRCode.toDataURL(currentUrl, { margin: 2, width: 220 });
-      setQrSrc(qr);
-    } catch (err) {
-      console.warn('QR code generation failed:', err);
-    }
-
-    const signalingUrl = import.meta.env.VITE_SIGNALING_URL || (window.location.port === '5173' ? 'http://localhost:3001' : window.location.origin);
-
-    engineRef.current = new DropLinkEngine(
-      signalingUrl,
-      {
-        onPeerConnected: (id) => setConnectedPeer(id),
-        onPeerDisconnected: () => {
-          setConnectedPeer(null);
-          setIsTransferring(false);
-          setIsPaused(false);
-        },
-        onTransferAborted: (reason) => {
-          setIsTransferring(false);
-          setIsPaused(false);
-          setMetrics(null);
-          setStatus(reason || 'Transfer Aborted');
-        },
-        onTransferPaused: () => {
-          setIsPaused(true);
-        },
-        onTransferResumed: () => {
-          setIsPaused(false);
-        },
-        onMetrics: (m) => {
-          setMetrics(m);
-          if (typeof m.isPaused === 'boolean') {
-            setIsPaused(m.isPaused);
-          }
-        },
-        onFileReceived: (name, path, file, checksum) => {
-          const url = URL.createObjectURL(file);
-          setReceivedFiles((prev) => [{ name, path, url, blob: file, checksum }, ...prev]);
-        },
-        onStatusChange: (msg) => setStatus(msg),
-      },
-      password
-    );
-
-    engineRef.current.joinRoom(roomId);
-    setJoined(true);
-  };
-
-  const refreshStorage = async () => {
-    try {
-      const [files, quota] = await Promise.all([listOPFSFiles(), getStorageQuota()]);
-      setOpfsFiles(files);
-      setQuotaInfo(quota);
-    } catch (err) {
-      console.warn('Storage refresh error:', err);
-    }
-  };
-
+  // Listen for hash changes in URL (e.g. browser navigation or paste)
   useEffect(() => {
-    refreshStorage();
-  }, [receivedFiles]);
+    const handleHashChange = () => {
+      const hash = window.location.hash.replace('#', '');
+      if (hash && hash !== roomId) {
+        setInputRoomId(hash);
+        setRoomId(hash);
+        if (rtcManagerRef.current) {
+          rtcManagerRef.current.initRoom(hash);
+          setIsJoined(true);
+        }
+      }
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, [roomId]);
 
-  const handleDownloadOPFSFile = async (filePath: string, fileName: string) => {
-    const blob = await getOPFSFileBlob(filePath);
-    if (!blob) return;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const handleDeleteOPFSFile = async (filePath: string) => {
-    await purgeOPFSEntry(filePath);
-    await refreshStorage();
-  };
-
-  const handlePurgeAll = async () => {
-    if (confirm('Delete all files currently in OPFS storage?')) {
-      await purgeAllOPFS();
-      await refreshStorage();
-      setReceivedFiles([]);
+  const handleJoinRoom = (targetId?: string) => {
+    const roomToJoin = (targetId ?? inputRoomId).trim().replace(/^#/, '');
+    if (!roomToJoin) return;
+    setRoomError(null);
+    setRoomId(roomToJoin);
+    setInputRoomId(roomToJoin);
+    window.location.hash = roomToJoin;
+    if (rtcManagerRef.current) {
+      rtcManagerRef.current.initRoom(roomToJoin);
+      setIsJoined(true);
     }
   };
 
-  const handleTogglePause = () => {
-    if (!engineRef.current) return;
-    if (isPaused) {
-      engineRef.current.resumeTransfer();
-      setIsPaused(false);
-    } else {
-      engineRef.current.pauseTransfer();
-      setIsPaused(true);
+  const handleNewRoom = () => {
+    const newRoom = Math.random().toString(36).substring(2, 8);
+    setRoomError(null);
+    setInputRoomId(newRoom);
+    setRoomId(newRoom);
+    window.location.hash = newRoom;
+    if (rtcManagerRef.current) {
+      rtcManagerRef.current.initRoom(newRoom);
+      setIsJoined(true);
     }
   };
 
-  const handleCancelTransfer = () => {
-    if (engineRef.current) {
-      engineRef.current.cancelTransfer('Transfer aborted by user');
-      setIsTransferring(false);
-      setIsPaused(false);
-      setMetrics(null);
+  const handleCopyLink = async () => {
+    const activeRoom = roomId || inputRoomId.trim().replace(/^#/, '');
+    const url = `${window.location.origin}#${activeRoom}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy link:', err);
     }
   };
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(roomId);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      setSelectedFiles(Array.from(e.target.files));
+    }
+    e.target.value = '';
   };
 
-  const handleFilesSelect = (e: ChangeEvent<HTMLInputElement>) => {
-    if (!e.target.files) return;
-    const items: ExtendedFile[] = Array.from(e.target.files).map((file) => ({
-      file,
-      relativePath: file.name,
-    }));
-    setSelectedItems(items);
+  const handleFolderInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      setSelectedFiles(Array.from(e.target.files));
+    }
+    e.target.value = '';
   };
 
-  const handleFolderSelect = (e: ChangeEvent<HTMLInputElement>) => {
-    if (!e.target.files) return;
-    const items: ExtendedFile[] = Array.from(e.target.files).map((file) => ({
-      file,
-      relativePath: file.webkitRelativePath || file.name,
-    }));
-    setSelectedItems(items);
-  };
-
-  const handleSend = () => {
-    if (selectedItems.length > 0 && engineRef.current) {
+  const handleStartBroadcast = async () => {
+    if (selectedFiles.length === 0 || !rtcManagerRef.current) return;
+    try {
       setIsTransferring(true);
-      setIsPaused(false);
-      engineRef.current.sendBatch(selectedItems).finally(() => {
-        setIsTransferring(false);
-        setIsPaused(false);
+      setRoomError(null);
+      for (let i = 0; i < selectedFiles.length; i++) {
+        setCurrentBroadcastIndex(i);
+        const file = selectedFiles[i];
+        await rtcManagerRef.current.streamFileToAllPeers(file);
+      }
+    } catch (err: any) {
+      setRoomError(err.message || 'File transfer failed');
+    } finally {
+      setIsTransferring(false);
+      setCurrentBroadcastIndex(0);
+    }
+  };
+
+  const handleDownload = async (fileName: string) => {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const fileHandle = await root.getFileHandle(fileName);
+      const file = await fileHandle.getFile();
+      const url = URL.createObjectURL(file);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      console.error('Failed to download file from OPFS:', err);
+      setRoomError(err.message || `Failed to download "${fileName}"`);
+    }
+  };
+
+  const handlePreviewReceivedFile = async (file: { id: string; name: string; size: number }) => {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const fileHandle = await root.getFileHandle(file.name);
+      const fileBlob = await fileHandle.getFile();
+      openPreview({
+        name: file.name,
+        size: file.size || fileBlob.size,
+        blob: fileBlob,
+        type: fileBlob.type,
+      });
+    } catch (err: any) {
+      console.warn('Failed to read file from OPFS for preview:', err);
+      openPreview({
+        name: file.name,
+        size: file.size,
       });
     }
   };
 
-  // Transfer is in-flight if transferring flag is on OR metrics indicate active incomplete work
-  const isInFlight = (isTransferring || (metrics && metrics.percent < 100 && metrics.percent > 0));
+  const openPreview = (file: PreviewableFile) => {
+    setPreviewFile(file);
+    setIsPreviewOpen(true);
+  };
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col items-center justify-center p-6 font-sans">
-      <div className="max-w-xl w-full bg-neutral-900 border border-neutral-800 rounded-2xl p-6 shadow-2xl space-y-6">
-        
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-neutral-800 pb-4">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-indigo-600/20 text-indigo-400 rounded-lg">
-              <HardDrive className="w-6 h-6" />
-            </div>
-            <div>
-              <h1 className="text-xl font-bold tracking-tight">DropLink2</h1>
-              <p className="text-xs text-neutral-400">Zero-RAM OPFS P2P Streamer</p>
-            </div>
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col font-sans transition-colors duration-200">
+      {/* Header */}
+      <header className="border-b border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 backdrop-blur px-6 py-4 sticky top-0 z-40 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-black text-sm shadow">
+            DL
           </div>
-          <div className="flex items-center gap-2 text-xs px-3 py-1 bg-neutral-800 rounded-full border border-neutral-700">
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            <span className="text-neutral-300">
-              {password ? 'E2EE AES-GCM' : 'SyncAccessHandle'}
-            </span>
+          <div>
+            <h1 className="text-base font-bold tracking-tight">DropLink2</h1>
+            <p className="text-[11px] text-slate-500 dark:text-slate-400">Zero-RAM 5-Peer Mesh</p>
           </div>
         </div>
 
-        {/* Room / Controls Section */}
-        {!joined ? (
-          <div className="space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="px-3 py-1 rounded-full text-xs font-semibold border flex items-center gap-1.5 border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800/60">
+            <span
+              className={`w-2 h-2 rounded-full ${
+                connectedPeers.length > 0 ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+              }`}
+            />
+            <span>{connectedPeers.length}/5 Peers</span>
+          </div>
+
+          <button
+            onClick={toggleTheme}
+            className="p-2 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition cursor-pointer"
+            aria-label="Toggle theme"
+          >
+            {theme === 'dark' ? '☀️' : '🌙'}
+          </button>
+        </div>
+      </header>
+
+      {/* Main Container */}
+      <main className="flex-1 max-w-4xl w-full mx-auto p-6 space-y-6">
+        {roomError && (
+          <div className="p-4 rounded-xl bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-900 text-red-700 dark:text-red-300 text-sm flex items-center justify-between">
+            <span>{roomError}</span>
+            <button onClick={() => setRoomError(null)} className="font-bold ml-2 cursor-pointer">✕</button>
+          </div>
+        )}
+
+        {/* Room Control Bar */}
+        <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-4">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
-              <label className="text-xs font-semibold text-neutral-400 uppercase tracking-wider block mb-1">
-                Room ID
-              </label>
-              <input
-                type="text"
-                value={roomId}
-                onChange={(e) => setRoomId(e.target.value)}
-                placeholder="Enter or create room code"
-                className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-sm focus:outline-hidden focus:border-indigo-500 font-mono"
-              />
+              <span className="text-xs uppercase font-bold tracking-wider text-slate-400">Mesh Room</span>
+              <div className="flex items-center gap-2 mt-0.5">
+                <span className="text-xl font-mono font-bold text-indigo-600 dark:text-indigo-400">
+                  #{roomId || '------'}
+                </span>
+                {isJoined ? (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 rounded-full text-[11px] font-semibold">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    Joined
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800 rounded-full text-[11px] font-semibold">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                    Not Joined
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                Share this link or URL hash with up to 4 other devices to mesh connect.
+              </p>
             </div>
 
-            <div>
-              <label className="text-xs font-semibold text-neutral-400 uppercase tracking-wider block mb-1">
-                Password (Optional End-to-End Encryption)
-              </label>
-              <div className="relative">
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Leave empty for unencrypted fast stream"
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-sm focus:outline-hidden focus:border-indigo-500 pl-10"
-                />
-                <Lock className="w-4 h-4 text-neutral-500 absolute left-3.5 top-3.5" />
-              </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={handleCopyLink}
+                className="px-3.5 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
+                title="Copy direct room link to clipboard"
+              >
+                {copied ? '✓ Copied Link' : 'Copy Link'}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleNewRoom}
+                className="px-3.5 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
+                title="Generate fresh random room"
+              >
+                New Room
+              </button>
+            </div>
+          </div>
+
+          {/* Interactive Room Input Bar */}
+          <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+            <div className="relative flex-1">
+              <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-slate-400 font-mono text-sm">#</span>
+              <input
+                type="text"
+                value={inputRoomId}
+                onChange={(e) => setInputRoomId(e.target.value.trim())}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleJoinRoom();
+                }}
+                placeholder="Type or paste room ID (e.g. y3heon)"
+                className="w-full pl-8 pr-4 py-2 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-xl text-sm font-mono text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 transition"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => handleJoinRoom()}
+              disabled={!inputRoomId.trim()}
+              className={`px-6 py-2 text-sm font-semibold rounded-xl shadow-sm transition cursor-pointer ${
+                !inputRoomId.trim()
+                  ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
+                  : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+              }`}
+            >
+              {isJoined && inputRoomId.trim().replace(/^#/, '') === roomId ? 'Re-Join' : 'Join Room'}
+            </button>
+          </div>
+        </section>
+
+        {uploadProgress && (
+          <TransferProgress progress={uploadProgress} direction="upload" />
+        )}
+
+        {/* Dispatch File Section */}
+        <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">Dispatch Files to Mesh</h2>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isTransferring}
+                className="px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
+              >
+                Select Files
+              </button>
+              <button
+                type="button"
+                onClick={() => folderInputRef.current?.click()}
+                disabled={isTransferring}
+                className="px-3.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 transition cursor-pointer"
+              >
+                Select Folder
+              </button>
+            </div>
+          </div>
+
+          {/* Hidden inputs */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            id="file-input"
+            multiple
+            className="hidden"
+            onChange={handleFileInputChange}
+            disabled={isTransferring}
+          />
+          <input
+            ref={folderInputRef}
+            type="file"
+            id="folder-input"
+            className="hidden"
+            {...({ webkitdirectory: '', directory: '' } as any)}
+            onChange={handleFolderInputChange}
+            disabled={isTransferring}
+          />
+
+          {/* Dropzone */}
+          <div
+            onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setIsDragging(false);
+              if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                setSelectedFiles(Array.from(e.dataTransfer.files));
+              }
+            }}
+            className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors cursor-pointer ${
+              isDragging
+                ? 'border-indigo-500 bg-indigo-50/50 dark:bg-indigo-950/30'
+                : 'border-slate-300 dark:border-slate-700 hover:border-indigo-500'
+            }`}
+            onClick={() => {
+              if (selectedFiles.length === 0) fileInputRef.current?.click();
+            }}
+          >
+            <div className="flex flex-col items-center space-y-2">
+              <span className="text-3xl">📁</span>
+              {selectedFiles.length === 0 ? (
+                <>
+                  <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                    Click "Select Files", "Select Folder", or drop files/folders here
+                  </span>
+                  <span className="text-xs text-slate-400">
+                    Any format, zero-RAM chunked disk slice
+                  </span>
+                </>
+              ) : selectedFiles.length === 1 ? (
+                <>
+                  <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                    {selectedFiles[0].name}
+                  </span>
+                  <span className="text-xs text-slate-400">
+                    {(selectedFiles[0].size / (1024 * 1024)).toFixed(2)} MB
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                    {selectedFiles.length} files selected
+                  </span>
+                  <span className="text-xs text-slate-400">
+                    Total: {(selectedFiles.reduce((acc, f) => acc + f.size, 0) / (1024 * 1024)).toFixed(2)} MB
+                  </span>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Selected Files List (if > 1 file selected) */}
+          {selectedFiles.length > 1 && (
+            <div className="max-h-40 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800 rounded-xl border border-slate-200 dark:border-slate-800 p-2 text-xs">
+              {selectedFiles.map((file, idx) => (
+                <div key={idx} className="py-1.5 px-2 flex items-center justify-between">
+                  <div className="truncate flex-1 pr-2">
+                    <span className="font-medium text-slate-800 dark:text-slate-200">{file.name}</span>
+                    <span className="ml-2 text-slate-400">({(file.size / (1024 * 1024)).toFixed(2)} MB)</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => openPreview({ name: file.name, size: file.size, blob: file, type: file.type })}
+                    className="text-[11px] font-semibold text-indigo-600 dark:text-indigo-400 hover:underline flex-shrink-0 cursor-pointer"
+                  >
+                    Preview
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Action Row */}
+          <div className="flex items-center justify-between pt-2">
+            <div className="flex items-center gap-3">
+              {selectedFiles.length === 1 && (
+                <button
+                  type="button"
+                  onClick={() => openPreview({
+                    name: selectedFiles[0].name,
+                    size: selectedFiles[0].size,
+                    blob: selectedFiles[0],
+                    type: selectedFiles[0].type
+                  })}
+                  className="text-xs font-semibold text-indigo-600 dark:text-indigo-400 hover:underline cursor-pointer"
+                >
+                  Preview Selected File
+                </button>
+              )}
+              {selectedFiles.length > 0 && !isTransferring && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedFiles([])}
+                  className="text-xs font-semibold text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 cursor-pointer"
+                >
+                  Clear Selection
+                </button>
+              )}
             </div>
 
             <button
-              onClick={handleJoin}
-              className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3 rounded-xl transition-colors shadow-lg shadow-indigo-600/20 cursor-pointer"
+              type="button"
+              onClick={handleStartBroadcast}
+              disabled={selectedFiles.length === 0 || connectedPeers.length === 0 || isTransferring}
+              className={`ml-auto px-6 py-2.5 rounded-xl text-sm font-semibold shadow-md transition ${
+                selectedFiles.length === 0 || connectedPeers.length === 0 || isTransferring
+                  ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
+                  : 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer'
+              }`}
             >
-              Join Room
+              {isTransferring
+                ? selectedFiles.length > 1
+                  ? `Broadcasting (${currentBroadcastIndex + 1}/${selectedFiles.length})...`
+                  : 'Broadcasting...'
+                : selectedFiles.length > 1
+                ? `Broadcast ${selectedFiles.length} Files to ${connectedPeers.length} Peer(s)`
+                : `Broadcast to ${connectedPeers.length} Peer(s)`}
             </button>
           </div>
-        ) : (
-          <div className="space-y-6">
-            {/* Connection Status Bar */}
-            <div className="flex items-center justify-between p-3 bg-neutral-950/60 rounded-xl border border-neutral-800/80">
-              <div className="flex items-center gap-2.5">
-                <div className="relative flex items-center justify-center">
-                  <Wifi className={`w-4 h-4 ${connectedPeer ? 'text-emerald-400' : 'text-amber-400 animate-pulse'}`} />
-                </div>
-                <div className="flex flex-col">
-                  <span className="text-xs font-medium text-neutral-200">
-                    {connectedPeer ? 'Peer Connected' : 'Waiting for Peer'}
-                  </span>
-                  <span className="text-[10px] text-neutral-400">
-                    Room: <span className="font-mono text-neutral-200">{roomId}</span>
-                  </span>
-                </div>
-              </div>
+        </section>
 
-              <div className="flex items-center gap-1.5">
-                {qrSrc && (
-                  <button
-                    onClick={() => setShowQrModal(true)}
-                    className="p-1.5 hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 rounded-lg transition-colors cursor-pointer"
-                    title="View QR Code"
-                  >
-                    <QrCode className="w-4 h-4" />
-                  </button>
-                )}
-                <button
-                  onClick={handleCopy}
-                  className="p-1.5 hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 rounded-lg transition-colors cursor-pointer"
-                  title="Copy Room ID"
-                >
-                  {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
-                </button>
-                <button
-                  onClick={() => { refreshStorage(); setShowStorageModal(true); }}
-                  className="p-1.5 hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 rounded-lg transition-colors cursor-pointer"
-                  title="OPFS Storage Manager"
-                >
-                  <Database className="w-4 h-4 text-indigo-400" />
-                </button>
-              </div>
-            </div>
-
-            {/* Status Feedback */}
-            <div className="flex items-center justify-between text-xs px-1 text-neutral-400">
-              <div className="truncate max-w-[280px]">
-                <span className="text-neutral-500">Status: </span>
-                <span className="text-neutral-300 font-mono">{status}</span>
-              </div>
-              {password && (
-                <span className="text-[10px] text-emerald-400/80 flex items-center gap-1 bg-emerald-950/30 px-2 py-0.5 rounded border border-emerald-800/40">
-                  <Lock className="w-3 h-3" /> E2EE Enabled
-                </span>
-              )}
-            </div>
-
-            {/* File Pickers */}
-            <div className="space-y-3">
-              <label className="text-xs font-semibold text-neutral-400 uppercase tracking-wider block">
-                Choose Files or Entire Folder
-              </label>
-
-              <div className="grid grid-cols-2 gap-3">
-                <label className="flex flex-col items-center justify-center p-4 border border-dashed border-neutral-700 hover:border-indigo-500/50 hover:bg-indigo-500/5 rounded-xl cursor-pointer transition-all">
-                  <Files className="w-6 h-6 text-indigo-400 mb-2" />
-                  <span className="text-xs font-medium text-neutral-200">Select Files</span>
-                  <input
-                    type="file"
-                    multiple
-                    onChange={handleFilesSelect}
-                    className="hidden"
-                  />
-                </label>
-
-                <label className="flex flex-col items-center justify-center p-4 border border-dashed border-neutral-700 hover:border-indigo-500/50 hover:bg-indigo-500/5 rounded-xl cursor-pointer transition-all">
-                  <FolderUp className="w-6 h-6 text-indigo-400 mb-2" />
-                  <span className="text-xs font-medium text-neutral-200">Select Folder</span>
-                  <input
-                    type="file"
-                    // @ts-expect-error webkitdirectory is non-standard
-                    webkitdirectory=""
-                    directory=""
-                    multiple
-                    onChange={handleFolderSelect}
-                    className="hidden"
-                  />
-                </label>
-              </div>
-
-              {selectedItems.length > 0 && (
-                <div className="p-3 bg-neutral-950/50 rounded-xl border border-neutral-800/80 flex items-center justify-between text-xs">
-                  <span className="text-neutral-300">
-                    Staged: <strong className="text-white">{selectedItems.length}</strong> items (
-                    {(selectedItems.reduce((acc, curr) => acc + curr.file.size, 0) / (1024 * 1024)).toFixed(2)} MB total)
-                  </span>
-                </div>
-              )}
-
-              <button
-                disabled={selectedItems.length === 0 || !connectedPeer || isTransferring}
-                onClick={handleSend}
-                className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-xl transition-colors shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 cursor-pointer text-sm"
-              >
-                <Send className="w-4 h-4" />
-                <span>Stream Batch Directly to Disk</span>
-              </button>
-            </div>
-
-            {/* Metrics HUD */}
-            {metrics && (
-              <div className="p-4 bg-neutral-950 rounded-xl border border-neutral-800 space-y-3 font-mono text-xs">
-                <div className="flex justify-between items-center text-neutral-300">
-                  <span className="truncate max-w-[200px] font-sans font-medium text-sm text-neutral-100 flex items-center gap-1.5">
-                    {metrics.currentFileName}
-                    {isPaused && (
-                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-950 border border-amber-800 text-amber-300 font-bold">
-                        PAUSED
-                      </span>
-                    )}
-                  </span>
-                  <span className="text-indigo-400 font-bold text-sm">
-                    {metrics.percent.toFixed(1)}%
-                  </span>
-                </div>
-
-                <div className="w-full bg-neutral-800 h-2 rounded-full overflow-hidden">
-                  <div
-                    className={`h-full transition-all duration-150 ${isPaused ? 'bg-amber-500' : 'bg-indigo-500'}`}
-                    style={{ width: `${metrics.percent}%` }}
-                  />
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 text-[11px] text-neutral-400">
-                  <div className="flex items-center gap-1.5 p-2 bg-neutral-900 rounded border border-neutral-800">
-                    <Gauge className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-                    <span>{metrics.speedMBps.toFixed(1)} MB/s</span>
+        {/* Received Files List */}
+        {receivedFiles.length > 0 && (
+          <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 shadow-sm space-y-3">
+            <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">Received Files (Direct to OPFS)</h2>
+            <div className="divide-y divide-slate-100 dark:divide-slate-800">
+              {receivedFiles.map((file) => (
+                <div key={file.id} className="py-3 flex items-center justify-between gap-4">
+                  <div className="truncate flex-1">
+                    <div className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{file.name}</div>
+                    <div className="text-xs text-slate-400">{(file.size / (1024 * 1024)).toFixed(2)} MB</div>
                   </div>
-                  <div className="flex items-center gap-1.5 p-2 bg-neutral-900 rounded border border-neutral-800">
-                    <Activity className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    <span>{metrics.bufferedAmountMB.toFixed(1)} MB buf</span>
-                  </div>
-                  <div className="flex items-center gap-1.5 p-2 bg-neutral-900 rounded border border-neutral-800">
-                    <Database className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                    <span>{(metrics.bytesTransferred / (1024 * 1024)).toFixed(0)} MB done</span>
-                  </div>
-                </div>
-
-                <div className="pt-2 flex items-center justify-end gap-2">
-                  {/* Both Sender and Receiver can pause/resume if transfer is active or paused */}
-                  {(isInFlight || isPaused) && (
+                  <div className="flex items-center gap-2 flex-shrink-0">
                     <button
-                      onClick={handleTogglePause}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors cursor-pointer ${
-                        isPaused
-                          ? 'bg-emerald-950/80 hover:bg-emerald-900 border-emerald-700 text-emerald-300'
-                          : 'bg-amber-950/80 hover:bg-amber-900 border-amber-700 text-amber-300'
-                      }`}
+                      type="button"
+                      onClick={() => handlePreviewReceivedFile(file)}
+                      className="px-3 py-1.5 text-xs font-semibold bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-lg transition cursor-pointer"
                     >
-                      {isPaused ? <Play className="w-4 h-4 text-emerald-400" /> : <Pause className="w-4 h-4 text-amber-400" />}
-                      <span>{isPaused ? 'Resume' : 'Pause'}</span>
+                      Inspect / Preview
                     </button>
-                  )}
-                  <button
-                    onClick={handleCancelTransfer}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-950/70 hover:bg-rose-900 border border-rose-800/80 text-rose-300 text-xs font-semibold rounded-lg transition-colors cursor-pointer"
-                  >
-                    <XCircle className="w-4 h-4 text-rose-400" />
-                    <span>Cancel Transfer</span>
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Received Files List */}
-            {receivedFiles.length > 0 && (
-              <div className="space-y-3 border-t border-neutral-800 pt-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">
-                    Completed Transfers ({receivedFiles.length})
-                  </h3>
-                  {receivedFiles.length > 1 && (
                     <button
-                      onClick={() => downloadAllAsZip(receivedFiles, `droplink2-${roomId}.zip`)}
-                      className="flex items-center gap-1.5 px-3 py-1 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-400 text-xs font-medium rounded-lg border border-indigo-500/30 transition-colors cursor-pointer"
+                      type="button"
+                      onClick={() => handleDownload(file.name)}
+                      className="px-3 py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg shadow-sm transition cursor-pointer"
                     >
-                      <Archive className="w-3.5 h-3.5" />
-                      <span>Download All as ZIP</span>
+                      Download
                     </button>
-                  )}
+                  </div>
                 </div>
-
-                <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                  {receivedFiles.map((f, i) => (
-                    <div key={i} className="flex flex-col p-3 bg-neutral-800/40 rounded-lg border border-neutral-800 gap-1.5">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2 truncate pr-2">
-                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                          <span className="text-sm truncate font-medium" title={f.path}>{f.path}</span>
-                        </div>
-                        <a
-                          href={f.url}
-                          download={f.name}
-                          className="flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 font-medium shrink-0"
-                        >
-                          <Download className="w-4 h-4" /> Download
-                        </a>
-                      </div>
-                      {f.checksum && (
-                        <div className="text-[10px] font-mono text-neutral-400 truncate flex items-center gap-1 bg-neutral-900/60 px-2 py-1 rounded border border-neutral-800/80">
-                          <span className="text-emerald-400 font-semibold">SHA-256:</span>
-                          <span className="truncate text-neutral-300">{f.checksum}</span>
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* QR Code Modal */}
-        {showQrModal && qrSrc && (
-          <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
-            <div className="bg-neutral-900 border border-neutral-800 rounded-2xl max-w-xs w-full p-6 shadow-2xl space-y-4 flex flex-col items-center">
-              <div className="w-full flex items-center justify-between border-b border-neutral-800 pb-2">
-                <span className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">Scan to Join</span>
-                <button
-                  onClick={() => setShowQrModal(false)}
-                  className="p-1 hover:bg-neutral-800 rounded-lg text-neutral-400 hover:text-neutral-200 transition-colors cursor-pointer"
-                >
-                  <XCircle className="w-4 h-4" />
-                </button>
-              </div>
-              <div className="p-3 bg-white rounded-xl shadow-inner">
-                <img src={qrSrc} alt="Room QR Code" className="w-44 h-44" />
-              </div>
-              <p className="text-[11px] font-mono text-neutral-400 text-center break-all">
-                Room: {roomId}
-              </p>
+              ))}
             </div>
-          </div>
+          </section>
         )}
+      </main>
 
-        {/* OPFS Storage Modal */}
-        {showStorageModal && (
-          <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
-            <div className="bg-neutral-900 border border-neutral-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 max-h-[85vh] flex flex-col">
-              <div className="flex items-center justify-between pb-3 border-b border-neutral-800">
-                <div className="flex items-center gap-2">
-                  <Database className="w-5 h-5 text-indigo-400" />
-                  <h2 className="text-base font-bold text-neutral-100">OPFS Storage Manager</h2>
-                </div>
-                <button
-                  onClick={() => setShowStorageModal(false)}
-                  className="p-1 hover:bg-neutral-800 rounded-lg text-neutral-400 hover:text-neutral-200 transition-colors cursor-pointer"
-                >
-                  <XCircle className="w-5 h-5" />
-                </button>
-              </div>
-
-              {/* Quota Bar */}
-              {quotaInfo && (
-                <div className="p-3 bg-neutral-950/70 border border-neutral-800 rounded-xl space-y-2 text-xs font-mono">
-                  <div className="flex justify-between text-neutral-300">
-                    <span>Used: {(quotaInfo.usageBytes / (1024 * 1024)).toFixed(1)} MB</span>
-                    <span>Quota: {(quotaInfo.quotaBytes / (1024 * 1024 * 1024)).toFixed(1)} GB</span>
-                  </div>
-                  <div className="w-full bg-neutral-800 h-1.5 rounded-full overflow-hidden">
-                    <div
-                      className="bg-indigo-500 h-full transition-all"
-                      style={{ width: `${Math.min(100, quotaInfo.percentUsed)}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-
-              {/* Files Table */}
-              <div className="flex-1 overflow-y-auto space-y-2 pr-1 min-h-[150px]">
-                {opfsFiles.length === 0 ? (
-                  <div className="text-center py-8 text-neutral-500 text-xs">
-                    No files currently saved in browser OPFS storage.
-                  </div>
-                ) : (
-                  opfsFiles.map((item, idx) => (
-                    <div
-                      key={idx}
-                      className="p-2.5 bg-neutral-950/50 border border-neutral-800/80 rounded-lg flex items-center justify-between text-xs"
-                    >
-                      <div className="flex items-center gap-2 truncate pr-2">
-                        {item.path.includes('/') ? (
-                          <Folder className="w-4 h-4 text-indigo-400 shrink-0" />
-                        ) : (
-                          <Files className="w-4 h-4 text-neutral-400 shrink-0" />
-                        )}
-                        <div className="flex flex-col truncate">
-                          <span className="font-medium text-neutral-200 truncate">{item.name}</span>
-                          <span className="text-[10px] text-neutral-500 truncate">{item.path}</span>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        <span className="text-[10px] font-mono text-neutral-400">
-                          {(item.size / (1024 * 1024)).toFixed(2)} MB
-                        </span>
-                        <button
-                          onClick={() => handleDownloadOPFSFile(item.path, item.name)}
-                          className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-indigo-400 transition-colors cursor-pointer"
-                          title="Download"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          onClick={() => handleDeleteOPFSFile(item.path)}
-                          className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-rose-400 transition-colors cursor-pointer"
-                          title="Delete from OPFS"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-
-              {/* Modal Footer Actions */}
-              <div className="flex items-center justify-between pt-3 border-t border-neutral-800">
-                <button
-                  onClick={refreshStorage}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800 rounded-lg transition-colors cursor-pointer"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" /> Refresh
-                </button>
-                <button
-                  onClick={handlePurgeAll}
-                  disabled={opfsFiles.length === 0}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-rose-400 hover:text-rose-300 hover:bg-rose-950/50 border border-rose-900/50 rounded-lg transition-colors disabled:opacity-50 cursor-pointer"
-                >
-                  <Trash2 className="w-3.5 h-3.5" /> Purge All Storage
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-      </div>
+      <FilePreviewModal
+        file={previewFile}
+        isOpen={isPreviewOpen}
+        onClose={() => setIsPreviewOpen(false)}
+      />
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ThemeProvider>
+      <MainApp />
+    </ThemeProvider>
   );
 }
